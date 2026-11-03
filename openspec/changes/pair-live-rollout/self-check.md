@@ -21,7 +21,7 @@
 - The initial fixture invocation failed because a vanilla Node process lacked Pi's host-provided peer dependency; an independent isolated stage used the existing repository dependency tree. The real Pi loader did not need any node_modules in the candidate.
 - An npm script typecheck initially failed because its executable shim was unavailable; the actual installed TypeScript entrypoint then passed.
 - The first two code gates returned ESCALATE_TO_HUMAN because unauthorized-test evidence was missing or not read: the CLI only loads the first test entry. After running the actual unauthorized test and moving that entry first, gate-code returned PASS_WITH_WARNINGS (trust 75, 0 blocking; absent phase.json means degraded mode). It bound diff SHA-256 beginning `b0b3a20a2d94f0ea`; all three verdicts are retained. Remaining warnings cover the not-yet-exercised failed-promotion guard and no L2 semantic model review. Only documentation and the verdict artifact were added after the gate; the code did not change.
-- The live package has not been installed or activated yet, and no real overflow has been exercised.
+- The live package was subsequently installed from commit `031e93d5b866324751bc07f152505103085e294a` and verified byte-for-byte; activation in the already-running Pi is still pending a user restart. No real overflow has been exercised. See `INSTALLATION.md`.
 - **Rollback plan:** preserve a SHA-256 backup of the old package and its same-volume prior directory; restore only if the installed candidate and ownership are verified unchanged. Never restore old Pair state or game saves as part of package rollback.
 
 ## Unresolved Assumptions
