@@ -304,7 +304,7 @@ export async function acquireLock(dir, owner, { name = '.owner-lock', conflict, 
         throw new Error('Pair lock owner is missing or unreadable; ownership cannot be proven and the lock is held.');
       }
       assert(plain(previous) && typeof previous.pid === 'number', 'Invalid Pair owner lock: pid must be a number');
-      assert(!await ownerAlive(previous), conflict ? conflict(previous) : `Pair session is already owned by process ${previous.pid}; never attach two controllers to one session.`);
+      assert(!await ownerAlive(previous), conflict ? conflict(previous) : `Pair session is already owned by process ${previous.pid}, or its owner status is unknown; never attach two controllers to one session.`);
       // Serialize takeovers without ever removing the old lock directory. SQLite's OS-held
       // transaction is released by the OS even if Main is killed during the guard; a second
       // controller therefore cannot skip the guard or inherit an orphaned claim file.
