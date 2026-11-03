@@ -196,6 +196,158 @@ test('re-planning past the limit resets the per-step count, is bounded to two pe
   } finally { await cleanup(f); }
 });
 
+test('a changed step ID retains resolved evidence and a reloadable continuation', async () => {
+  const f = await fixture();
+  const { controller, task, record, runtime } = f;
+  try {
+    const original = structuredClone(task.report);
+    const prompts = stubContinuation(runtime, record);
+    const replacement = { id: 'replacement-step', title: 'Smaller repair', instructions: 'Repair first' };
+    await assert.doesNotReject(controller.decide({ workerId: 'worker', taskId: task.id,
+      reportId: original.reportId, action: 'revise', feedback: 'Replace the unfinished step',
+      steps: [replacement, task.steps[1]] }));
+    await settled(controller);
+    assert.equal(prompts.length, 1, 'the same worker receives the replacement step');
+    assert.equal(task.steps[0].id, replacement.id);
+    assert.deepEqual(task.report, original, 'old evidence and its producer tuple are not rewritten');
+    const stored = JSON.parse(await fs.readFile(path.join(controller.dir, 'state.json'), 'utf8'));
+    assert.doesNotThrow(() => validateStoredState(stored, { ownerSession: controller.ownerSession, cwd: controller.cwd }));
+    assert.equal(stored.workers.worker.task.report.payload.stepId, 's1');
+    assert.equal(stored.workers.worker.task.planRevision, 2);
+    assert.equal(stored.workers.worker.task.decisions[original.reportId].attemptId, original.attemptId);
+    assert.ok(await fs.stat(original.snapshotRef), 'original snapshot remains readable');
+    const order = JSON.parse(await fs.readFile(path.join(f.workerDir, 'work-order.json'), 'utf8'));
+    assert.equal(order.planRevision, 2);
+
+    // Historical evidence may outlive its step, but it still belongs to this task/worker/decision.
+    const validate = value => validateStoredState(value, { ownerSession: controller.ownerSession, cwd: controller.cwd });
+    const mutations = [
+      ['task identity', s => { s.workers.worker.task.report.payload.taskId = 'other-task'; }, /different task/],
+      ['worker identity', s => { s.workers.worker.task.report.workerId = 'other-worker'; }, /different worker/],
+      ['decision binding', s => { s.workers.worker.task.decisions[original.reportId].attemptId = 'other-attempt'; }, /different retained report attempt/],
+      ['same-plan history', s => { s.workers.worker.task.report.planRevision = 2; }, /outside the task plan/],
+      ['cancel is not a continuation binding', s => { s.workers.worker.task.decisions[original.reportId] = { hash: digest('cancel'), action: 'cancel', at: Date.now() }; }, /outside the task plan/],
+      ['same-attempt history', s => { s.workers.worker.task.report.attemptNumber = s.workers.worker.task.attemptNumber; }, /outside the task plan/],
+    ];
+    for (const [label, mutate, expected] of mutations) {
+      const forged = structuredClone(stored);
+      mutate(forged);
+      forged.workers.worker.task.report.payloadHash = digest(forged.workers.worker.task.report.payload);
+      assert.throws(() => validate(forged), expected, label);
+    }
+    const current = structuredClone(stored);
+    current.notices = {};
+    const active = current.workers.worker.task;
+    active.decisions = {}; active.lastDecision = null; active.status = 'review';
+    for (const key of ['attemptId', 'attemptNumber', 'planRevision', 'leaseId']) active.report[key] = active[key];
+    active.report.payload.stepId = replacement.id;
+    active.report.payloadHash = digest(active.report.payload);
+    assert.doesNotThrow(() => validate(current));
+    for (const key of ['attemptId', 'attemptNumber', 'planRevision', 'leaseId']) {
+      const forged = structuredClone(current);
+      forged.workers.worker.task.report[key] = typeof active[key] === 'number' ? active[key] + 1 : 'wrong-producer';
+      assert.throws(() => validate(forged), /contradicts its task attempt/, key);
+    }
+    const unknown = structuredClone(current);
+    unknown.workers.worker.task.report.payload.stepId = 'unknown-step';
+    unknown.workers.worker.task.report.payloadHash = digest(unknown.workers.worker.task.report.payload);
+    assert.throws(() => validate(unknown), /outside the task plan/);
+
+    // A real follow-up decision can advance the new plan, then cancellation still works.
+    active.report.reportId = 'report-repaired';
+    task.report = active.report; task.status = 'review'; record.status = 'review';
+    await controller.persist();
+    await controller.decide({ workerId: 'worker', taskId: task.id, reportId: active.report.reportId,
+      action: 'approve', feedback: 'Replacement complete', checkpointHash: original.checkpoint.checkpointHash });
+    await settled(controller);
+    assert.equal(task.stepIndex, 1);
+    assert.equal(prompts.length, 2);
+    await controller.cancel('worker', 'Offline fixture complete');
+    assert.equal(task.status, 'cancelled');
+    await assert.doesNotReject(controller.persist());
+  } finally { await cleanup(f); }
+});
+
+test('an invalid completed-prefix re-plan does not poison the live task', async () => {
+  const f = await fixture();
+  const { controller, task } = f;
+  try {
+    task.stepIndex = 1;
+    task.report.payload.stepId = 's2';
+    task.report.payloadHash = digest(task.report.payload);
+    await controller.persist();
+    const before = structuredClone(task);
+    const invalid = [{ ...task.steps[0], title: 'Changed completed step' },
+      { id: 'replacement-step', title: 'Replacement', instructions: 'Repair' }];
+    await assert.rejects(controller.decide({ workerId: 'worker', taskId: task.id,
+      reportId: task.report.reportId, action: 'revise', feedback: 'Invalid prefix', steps: invalid }),
+    /Completed steps must be kept unchanged/);
+    assert.deepEqual(task, before, 'a rejected proposal must not spend counters or change live state');
+    await assert.doesNotReject(controller.persist());
+    await assert.rejects(fs.stat(path.join(f.workerDir, 'work-order.json')), { code: 'ENOENT' });
+  } finally { await cleanup(f); }
+});
+
+test('a rejected continuation draft publishes no plan or partial task mutation', async () => {
+  const f = await fixture();
+  const { controller, task } = f;
+  try {
+    task.attemptNumber = Number.MAX_SAFE_INTEGER;
+    task.report.attemptNumber = task.attemptNumber;
+    await controller.persist();
+    stubContinuation(f.runtime, f.record);
+    const before = structuredClone(task);
+    await assert.rejects(controller.decide({ workerId: 'worker', taskId: task.id,
+      reportId: task.report.reportId, action: 'revise', feedback: 'Overflow must not poison state',
+      steps: [{ id: 'replacement-step', title: 'Replacement', instructions: 'Repair' }, task.steps[1]] }), /attemptNumber/);
+    assert.deepEqual(task, before);
+    assert.equal(controller.state.notices[task.report.reportId].status, 'offered');
+    await assert.rejects(fs.stat(path.join(f.workerDir, 'work-order.json')), { code: 'ENOENT' });
+    await assert.doesNotReject(controller.persist());
+  } finally { await cleanup(f); }
+});
+
+test('a changed-ID continuation failure is interrupted instead of stranded activating', async () => {
+  const f = await fixture();
+  const { controller, task, runtime, record } = f;
+  try {
+    const original = structuredClone(task.report);
+    const prompts = stubContinuation(runtime, record);
+    runtime.prepareActivation = async () => { throw Error('injected readiness failure'); };
+    await controller.decide({ workerId: 'worker', taskId: task.id, reportId: original.reportId,
+      action: 'revise', feedback: 'Replacement before a readiness error',
+      steps: [{ id: 'replacement-step', title: 'Repair', instructions: 'Repair' }, task.steps[1]] });
+    await settled(controller);
+    assert.equal(prompts.length, 0);
+    assert.equal(task.status, 'interrupted');
+    assert.match(task.interruption, /injected readiness failure/);
+    assert.deepEqual(task.report, original);
+    await assert.doesNotReject(controller.persist());
+    await controller.cancel('worker', 'Do not retry failed activation in fixture');
+    assert.equal(task.status, 'cancelled');
+  } finally { await cleanup(f); }
+});
+
+test('a changed-ID reservation rejection leaves a valid interrupted task', async () => {
+  const f = await fixture();
+  const { controller, task, runtime, record } = f;
+  try {
+    stubContinuation(runtime, record);
+    runtime.reserveActivation = () => { throw Error('injected reservation failure'); };
+    await assert.rejects(controller.decide({ workerId: 'worker', taskId: task.id,
+      reportId: task.report.reportId, action: 'revise', feedback: 'Reserve a replacement step',
+      steps: [{ id: 'replacement-step', title: 'Repair', instructions: 'Repair' }, task.steps[1]] }), /injected reservation failure/);
+    assert.equal(task.status, 'interrupted');
+    assert.match(task.interruption, /reservation held.*injected reservation failure/);
+    const state = JSON.parse(await fs.readFile(path.join(controller.dir, 'state.json'), 'utf8'));
+    assert.doesNotThrow(() => validateStoredState(state, { ownerSession: controller.ownerSession, cwd: controller.cwd }));
+    assert.equal(state.workers.worker.task.report.payload.stepId, 's1');
+    assert.equal(state.workers.worker.task.steps[0].id, 'replacement-step');
+    await controller.cancel('worker', 'Offline reservation failure fixture complete');
+    assert.equal(task.status, 'cancelled');
+  } finally { await cleanup(f); }
+});
+
 test('the re-plan bound is enforced per step position', async () => {
   const f = await fixture();
   const { controller, task } = f;

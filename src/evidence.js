@@ -196,7 +196,8 @@ const MEMORY_COPY_BYTES = 1024 * 1024;
  */
 // Anchored to the repository root: a nested dir/.pi/fabric-pair.json is the worker's file, not Pair's, so no
 // worker can hide a change by naming something after Pair's configuration.
-const PAIR_OWNED = [/^\.pi\/(?:fabric-)?pair\.json$/, /^\.pi\/(?:fabric-)?pair\.json\.v[1-9][0-9]{0,2}\.bak(?:\.[1-9][0-9]{0,2})?$/, /^\.pi\/fabric-pair[^/]*$/];
+const PAIR_OWNED = [/^\.pi\/(?:fabric-)?pair\.json$/, /^\.pi\/(?:fabric-)?pair\.json\.v[1-9][0-9]{0,2}\.bak(?:\.[1-9][0-9]{0,2})?$/, /^\.pi\/fabric-pair[^/]*$/,
+  /^(?:openspec|loomkit)\/changes\/[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}\/\.pair-checkpoint-[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}\.json$/];
 /** A sibling file that merely starts with a Pair name (docs/.pi/fabric-pair.json.md) is the human's, not Pair's. */
 const NOT_PAIR_OWNED = /\.(?:md|txt|json5|jsonc|ya?ml|toml|log|example)$/;
 /** @param {string} name a repository-relative path @returns {boolean} whether Pair owns it, so it is not worker evidence */

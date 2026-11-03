@@ -39,6 +39,7 @@
     "pack:check": "npm pack --dry-run --ignore-scripts"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },

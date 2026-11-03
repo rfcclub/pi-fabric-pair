@@ -11,13 +11,17 @@ history incrementally.
 - UI and pure-module suites: `cards-and-commands`, `dashboard`, `dashboard-e2e`, `glance`,
   `history-and-cue`, `task-summary`, `transcript`, `ui-smoke`.
 - Controller, worker, runtime and safety suites: `cache-observation`,
-  `controller-restart`, `controller-scan-recovery`, `efficiency`,
+  `context-overflow`, `controller-restart`, `controller-scan-recovery`, `efficiency`,
   `evidence-deletion`, `evidence-replacement`, `handoff-safety`, `main-settings`,
   `message-cards`, `native-profile`, `removed-limits`, `rpc-framing`,
   `liveness`, `peek-steer`, `runtime-startup`, `step-limit-escape`,
   `supervision-notices`, `watchdog-core`, `worker-speed`, `config-merge`,
   `pair-owned-paths`, `pair-config-checkpoint`, `worker-management`,
   `worker-removal`, `worker-commands`, `worker-config`, `low-runtime`.
+- Continuity and compatibility: `live-installed-compat`, `lock-abrupt-exit`,
+  `lock-concurrency`, `owner-proof`, `repository-lock-recovery`,
+  `workspace-discovery-task`, `workspace-discovery`. These exercise installed-source
+  compatibility, crash-safe locking, owner proof and workspace task discovery.
 - `heartbeat-docs`: the opt-in Main heartbeat (off adds nothing; `note` appends one
   display-only line with state, step, step time, event age and context; `wake` also
   starts a turn), that every supervision setting has an editable `/pair settings` row,

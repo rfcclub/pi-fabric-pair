@@ -98,7 +98,7 @@ export const MAX_WORKER_FALLBACKS = 4;
 /** @typedef {{mode: ReviewMode | 'final' | 'strict', finalReview: true, maxRevisions: number, summaryDetail: SummaryDetail}} PreDeferredPolicyV1 */
 /** @typedef {PreDeferredPolicyV1 & {maxRevisionsPerStep: number}} StoredPolicyV1 */
 /** @typedef {{id: string, requestId: string, objective: string, context: string, constraints: string[], steps: Step[], stepIndex: number, planRevision: number, status: TaskStatus, leaseId: string, verification: VerificationPolicy, startedAt: number, updatedAt: number, revisions: number, turns: number, usage: UsageTotals | null, baseSnapshotRef: string, lastDecision: LastDecision | null, dispatchSettleSequence?: number, pendingSince?: number, abortRequested?: boolean, interruption?: string, previousStatus?: string, completedAt?: number, cancelReason?: string, stepRevisions?: number, pausedBy?: 'human', mainRecoveries?: number, timeline?: import('./timeline.js').TimelineEntry[], mainFix?: {reportId: string, startedAt: number}, stepReplans?: {index: number, count: number}, changeKind?: 'main-fix', stepSteers?: {index: number, count: number}, watchdog?: {step: number, recoveries: number, noReportNudges: number, steers: number, nudged: boolean, nudgedAttemptId?: string, pingedAt?: number, providerWaits: number, retryAt: number | null, retryReason: string | null}}} StoredTaskFieldsV1 */
-/** @typedef {StoredTaskFieldsV1 & {workerId: string, attemptId: string, attemptNumber: number, pendingReport: ReportEnvelope | null, report: FinalizedReport | null, decisions: Record<string, StoredDecision>} & ({policy: StoredPolicyV1, limits: TaskLimits} | {policy: PreDeferredPolicyV1, limits: BaseTaskLimits})} StoredTaskV1 */
+/** @typedef {StoredTaskFieldsV1 & {workerId: string, attemptId: string, attemptNumber: number, pendingReport: ReportEnvelope | null, report: FinalizedReport | null, decisions: Record<string, StoredDecision>} & ({policy: StoredPolicyV1, limits: TaskLimits} | {policy: PreDeferredPolicyV1, limits: BaseTaskLimits}) & {loomkit?: {workspace: string, change: string, layout?: 'openspec' | 'loomkit'}, pendingArchives?: {reportId: string, attemptId: string, path: string}[]}} StoredTaskV1 */
 /** @typedef {{id: string, cwd: string, repoRoot: string, status: WorkerStatus, sessionId: string | null, sessionFile: string | null, bound: WorkerSpec, history: StoredHistoryV1[], usage: UsageTotals | null, error?: string | null, diagnosticFile?: string, lastObservation?: StoredTelemetryV1 | HistoricalTelemetryV1 | null, lastExchange?: StoredExchangeV1 | null, staleReports?: StoredStaleReportV1[], probe?: StoredProbeV1 | HistoricalProbeV1 | null, pid?: number, spawnedAt?: number, freshSession?: boolean, fallback?: StoredFallbackV1}} StoredWorkerFieldsV1 */
 /**
  * The fallback a worker runs on for the rest of its current task: which entry of its configured fallbacks, why, the
@@ -107,7 +107,8 @@ export const MAX_WORKER_FALLBACKS = 4;
  * @typedef {{index: number, reason: string, at: number, primary: WorkerSpec, primarySession: {sessionId: string | null, sessionFile: string | null} | null}} StoredFallbackV1
  */
 /** @typedef {StoredWorkerFieldsV1 & {workerGeneration: number, task: StoredTaskV1 | null}} StoredWorkerV1 */
-/** @typedef {{version: 1, ownerSession: string, ownerEpoch: number, cwd: string, workers: Record<string, StoredWorkerV1>, requests: Record<string, StoredRequestV1>, notices: Record<string, StoredNoticeV1>, mainPhase?: StoredMainPhaseV1, branch?: number}} StoredStateV1 */
+/** @typedef {{ownerSession: string, throughEpoch: number, changedAt: number, backupHash: string}} OwnerTransitionV1 */
+/** @typedef {{version: 1, ownerSession: string, ownerEpoch: number, cwd: string, workers: Record<string, StoredWorkerV1>, requests: Record<string, StoredRequestV1>, notices: Record<string, StoredNoticeV1>, mainPhase?: StoredMainPhaseV1, branch?: number, workspaceOrigin?: {cwd: string, ownerSession: string}, ownerTransitions?: OwnerTransitionV1[]}} StoredStateV1 */
 /** @typedef {'invalid-field' | 'missing-required-field' | 'mixed-identity' | 'partial-policy-layout' | 'hash-mismatch' | 'inconsistent-reference' | 'unsupported-version' | 'unsupported-shape' | 'unsupported-policy'} StoredIssueCode */
 /** @typedef {{code: StoredIssueCode, path: string, message: string}} StoredIssue */
 /** @typedef {{unsupported: StoredIssue[]}} ProfileFacts */
@@ -537,12 +538,18 @@ function checkProbe(value, label, workerId, ownerSession) {
  * @param {string} workerId
  * @param {Set<string>} stepIds
  * @param {boolean} current
+ * @param {boolean} resolved
  */
-function validateTaskReportIdentity(report, label, task, workerId, stepIds, current) {
+function validateTaskReportIdentity(report, label, task, workerId, stepIds, current, resolved) {
   const payload = object(report.payload, `${label}.payload`);
   reference(payload.taskId === task.id, `${label}.payload.taskId`, 'Report targets a different task');
   reference(report.workerId === workerId, `${label}.workerId`, 'Report targets a different worker');
-  reference(typeof payload.stepId === 'string' && stepIds.has(payload.stepId), `${label}.payload.stepId`, 'Report targets a step outside the task plan');
+  // A resolved report keeps its original producer tuple when a later plan replaces its step.
+  // Only older, decided evidence gets this exception; pending/current and same-plan reports do not.
+  const replacedPlan = !current && resolved
+    && integer(report.planRevision, `${label}.planRevision`, 1) < integer(task.planRevision, 'task.planRevision', 1)
+    && integer(report.attemptNumber, `${label}.attemptNumber`, 1) < integer(task.attemptNumber, 'task.attemptNumber', 1);
+  reference(typeof payload.stepId === 'string' && (stepIds.has(payload.stepId) || replacedPlan), `${label}.payload.stepId`, 'Report targets a step outside the task plan');
   if (current || report.attemptId === task.attemptId) {
     for (const key of ['attemptId', 'attemptNumber', 'planRevision', 'leaseId']) reference(report[key] === task[key], `${label}.${key}`, 'Report contradicts its task attempt');
   }
@@ -580,10 +587,25 @@ function keptTimeline(value, label) {
 /** @param {unknown} value @param {string} label @param {string} workerId @param {ProfileFacts} facts */
 function checkStoredTask(value, label, workerId, facts) {
   const task = object(value, label);
-  keys(task, ['id', 'requestId', 'objective', 'context', 'constraints', 'steps', 'stepIndex', 'planRevision', 'status', 'leaseId', 'policy', 'limits', 'verification', 'startedAt', 'updatedAt', 'revisions', 'turns', 'usage', 'baseSnapshotRef', 'pendingReport', 'report', 'decisions', 'lastDecision', 'dispatchSettleSequence', 'pendingSince', 'abortRequested', 'interruption', 'previousStatus', 'completedAt', 'cancelReason', 'stepRevisions', 'pausedBy', 'mainRecoveries', 'timeline', 'workerId', 'attemptId', 'attemptNumber', 'mainFix', 'stepReplans', 'changeKind', 'stepSteers', 'watchdog'], label);
+  keys(task, ['id', 'requestId', 'objective', 'context', 'constraints', 'steps', 'stepIndex', 'planRevision', 'status', 'leaseId', 'policy', 'limits', 'verification', 'startedAt', 'updatedAt', 'revisions', 'turns', 'usage', 'baseSnapshotRef', 'pendingReport', 'report', 'decisions', 'lastDecision', 'dispatchSettleSequence', 'pendingSince', 'abortRequested', 'interruption', 'previousStatus', 'completedAt', 'cancelReason', 'stepRevisions', 'pausedBy', 'mainRecoveries', 'timeline', 'workerId', 'attemptId', 'attemptNumber', 'mainFix', 'stepReplans', 'changeKind', 'stepSteers', 'watchdog', 'loomkit', 'pendingArchives'], label);
   for (const key of ['id', 'requestId', 'leaseId']) id(required(task, key, label), `${label}.${key}`);
   reference(id(required(task, 'workerId', label), `${label}.workerId`) === workerId, `${label}.workerId`, 'Task targets a different worker');
   id(required(task, 'attemptId', label), `${label}.attemptId`); integer(required(task, 'attemptNumber', label), `${label}.attemptNumber`, 1);
+  if (Object.hasOwn(task, 'pendingArchives')) {
+    const archives = array(task.pendingArchives, `${label}.pendingArchives`);
+    invariant(archives.length <= 40, 'Too many unfinished report archives', `${label}.pendingArchives`);
+    archives.forEach((value, index) => {
+      const at = `${label}.pendingArchives[${index}]`, archive = object(value, at); keys(archive, ['reportId', 'attemptId', 'path'], at);
+      id(required(archive, 'reportId', at), `${at}.reportId`); id(required(archive, 'attemptId', at), `${at}.attemptId`);
+      text(required(archive, 'path', at), `${at}.path`, 10000);
+    });
+  }
+  if (Object.hasOwn(task, 'loomkit')) {
+    const link = object(task.loomkit, `${label}.loomkit`); keys(link, ['workspace', 'change', 'layout'], `${label}.loomkit`);
+    text(required(link, 'workspace', `${label}.loomkit`), `${label}.loomkit.workspace`, 10000);
+    id(required(link, 'change', `${label}.loomkit`), `${label}.loomkit.change`);
+    if (Object.hasOwn(link, 'layout')) choice(link.layout, ['openspec', 'loomkit'], `${label}.loomkit.layout`);
+  }
   text(required(task, 'objective', label), `${label}.objective`, 6000); text(required(task, 'context', label), `${label}.context`, 24000);
   array(required(task, 'constraints', label), `${label}.constraints`).forEach((entry, index) => text(entry, `${label}.constraints[${index}]`, 2000));
   const steps = array(required(task, 'steps', label), `${label}.steps`);
@@ -609,7 +631,8 @@ function checkStoredTask(value, label, workerId, facts) {
     const suspended = status === 'paused' || status === 'interrupted';
     const sameAttempt = report.attemptId === task.attemptId;
     const decided = Object.hasOwn(decisions, reportId), current = key === 'pendingReport' || !decided && (waiting || suspended && sameAttempt);
-    validateTaskReportIdentity(report, at, task, workerId, stepIds, current);
+    const resolvedContinuation = decided && object(decisions[reportId], `${label}.decisions.${reportId}`).action !== 'cancel';
+    validateTaskReportIdentity(report, at, task, workerId, stepIds, current, resolvedContinuation);
     if (decided) {
       const decision = object(decisions[reportId], `${label}.decisions.${reportId}`), payload = object(report.payload, `${at}.payload`);
       if (decision.action !== 'cancel') {
@@ -852,7 +875,15 @@ function checkRetainedReferences(state) {
       if (task[key] === null) continue;
       const at = `${label}.task.${key}`, report = object(task[key], at), reportId = id(report.reportId, `${at}.reportId`);
       reference(!reports.has(reportId), `${at}.reportId`, 'Duplicate retained report identity'); reports.set(reportId, { workerId, task, report });
-      reference(report.ownerSession === state.ownerSession, `${at}.ownerSession`, 'Report belongs to a different stored owner');
+      const epoch = integer(report.ownerEpoch, `${at}.ownerEpoch`, 1), history = Array.isArray(state.ownerTransitions) ? state.ownerTransitions : [];
+      let lower = 0, allowed = false;
+      for (const value of history) {
+        const entry = object(value, 'state.ownerTransitions entry'), upper = integer(entry.throughEpoch, 'state.ownerTransitions.throughEpoch', 1);
+        if (report.ownerSession === entry.ownerSession && epoch > lower && epoch <= upper) allowed = true;
+        lower = upper;
+      }
+      if (report.ownerSession === state.ownerSession && epoch > lower && epoch <= Number(state.ownerEpoch)) allowed = true;
+      reference(allowed, `${at}.ownerSession`, 'Report producer does not match the owner at its epoch');
       retainAttempt(report, at, taskId, workerId);
     }
     for (const [reportId, value] of Object.entries(object(task.decisions, `${label}.task.decisions`))) {
@@ -891,10 +922,28 @@ function checkRetainedReferences(state) {
 }
 /** @param {unknown} value @param {ProfileFacts} facts @returns {asserts value is StoredStateV1} */
 function checkStoredStateProfile(value, facts) {
-  const state = object(value, 'state'); keys(state, ['version', 'ownerSession', 'cwd', 'workers', 'requests', 'notices', 'mainPhase', 'branch', 'ownerEpoch'], 'state');
+  const state = object(value, 'state'); keys(state, ['version', 'ownerSession', 'cwd', 'workers', 'requests', 'notices', 'mainPhase', 'branch', 'ownerEpoch', 'workspaceOrigin', 'ownerTransitions'], 'state');
   integer(required(state, 'version', 'state'), 'state.version', STATE_VERSION, STATE_VERSION);
-  const ownerSession = text(required(state, 'ownerSession', 'state'), 'state.ownerSession', 10000); text(required(state, 'cwd', 'state'), 'state.cwd', 10000);
-  integer(required(state, 'ownerEpoch', 'state'), 'state.ownerEpoch');
+  const ownerSession = text(required(state, 'ownerSession', 'state'), 'state.ownerSession', 10000); const cwd = text(required(state, 'cwd', 'state'), 'state.cwd', 10000);
+  const ownerEpoch = integer(required(state, 'ownerEpoch', 'state'), 'state.ownerEpoch');
+  if (Object.hasOwn(state, 'ownerTransitions') || Object.hasOwn(state, 'workspaceOrigin')) {
+    const origin = object(required(state, 'workspaceOrigin', 'state'), 'state.workspaceOrigin');
+    keys(origin, ['cwd', 'ownerSession'], 'state.workspaceOrigin');
+    reference(text(required(origin, 'cwd', 'state.workspaceOrigin'), 'state.workspaceOrigin.cwd', 10000) === cwd, 'state.workspaceOrigin.cwd', 'Workspace origin differs from its state');
+    const originalOwner = text(required(origin, 'ownerSession', 'state.workspaceOrigin'), 'state.workspaceOrigin.ownerSession', 10000);
+    const transitions = array(required(state, 'ownerTransitions', 'state'), 'state.ownerTransitions');
+    invariant(transitions.length > 0 && transitions.length <= 256, 'Owner transition history must contain 1–256 entries', 'state.ownerTransitions');
+    let previousEpoch = 0;
+    transitions.forEach((value, index) => {
+      const label = `state.ownerTransitions[${index}]`, item = object(value, label); keys(item, ['ownerSession', 'throughEpoch', 'changedAt', 'backupHash'], label);
+      const priorOwner = text(required(item, 'ownerSession', label), `${label}.ownerSession`, 10000);
+      const throughEpoch = integer(required(item, 'throughEpoch', label), `${label}.throughEpoch`, 1);
+      if (index === 0) reference(priorOwner === originalOwner, `${label}.ownerSession`, 'First owner differs from workspace origin');
+      invariant(throughEpoch > previousEpoch && throughEpoch < ownerEpoch, `${label}.throughEpoch is not a prior epoch`, `${label}.throughEpoch`);
+      integer(required(item, 'changedAt', label), `${label}.changedAt`); hash(required(item, 'backupHash', label), `${label}.backupHash`);
+      previousEpoch = throughEpoch;
+    });
+  }
   const workers = object(required(state, 'workers', 'state'), 'state.workers');
   for (const [workerId, record] of Object.entries(workers)) checkWorkerRecord(record, `state.workers.${workerId}`, id(workerId, 'state.workers key'), ownerSession, facts);
   const requests = object(required(state, 'requests', 'state'), 'state.requests');

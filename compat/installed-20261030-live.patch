@@ -1,0 +1,134 @@
+diff --git a/src/contracts.js b/src/contracts.js
+index 774b49d..e15acf7 100644
+--- a/src/contracts.js
++++ b/src/contracts.js
+@@ -509,12 +509,19 @@ function checkProbe(value, label, workerId, ownerSession, facts) {
+  * @param {Set<string>} stepIds
+  * @param {boolean} current
+  * @param {boolean} historical
++ * @param {boolean} resolved
+  */
+-function validateTaskReportIdentity(report, label, task, workerId, stepIds, current, historical) {
++function validateTaskReportIdentity(report, label, task, workerId, stepIds, current, historical, resolved) {
+   const payload = object(report.payload, `${label}.payload`);
+   reference(payload.taskId === task.id, `${label}.payload.taskId`, 'Report targets a different task');
+   reference(report.workerId === workerId, `${label}.workerId`, 'Report targets a different worker');
+-  reference(typeof payload.stepId === 'string' && stepIds.has(payload.stepId), `${label}.payload.stepId`, 'Report targets a step outside the task plan');
++  // Decided evidence retains its producer tuple when a later plan replaces its
++  // step. Legacy schemas, pending/current reports and same-plan attempts do not
++  // receive this exception. Decision/report attempt binding is checked below.
++  const replacedPlan = !historical && !current && resolved
++    && integer(report.planRevision, `${label}.planRevision`, 1) < integer(task.planRevision, 'task.planRevision', 1)
++    && integer(report.attemptNumber, `${label}.attemptNumber`, 1) < integer(task.attemptNumber, 'task.attemptNumber', 1);
++  reference(typeof payload.stepId === 'string' && (stepIds.has(payload.stepId) || replacedPlan), `${label}.payload.stepId`, 'Report targets a step outside the task plan');
+   if (current || !historical && report.attemptId === task.attemptId) {
+     for (const key of historical ? ['planRevision', 'leaseId'] : ['attemptId', 'attemptNumber', 'planRevision', 'leaseId']) reference(report[key] === task[key], `${label}.${key}`, 'Report contradicts its task attempt');
+   }
+@@ -559,7 +566,8 @@ function checkStoredTask(value, label, workerId, historical, facts) {
+     const suspended = status === 'paused' || status === 'interrupted';
+     const sameAttempt = historical ? report.leaseId === task.leaseId && report.planRevision === task.planRevision : report.attemptId === task.attemptId;
+     const decided = Object.hasOwn(decisions, reportId), current = key === 'pendingReport' || !decided && (waiting || suspended && sameAttempt);
+-    validateTaskReportIdentity(report, at, task, workerId, stepIds, current, historical);
++    const resolvedContinuation = key === 'report' && decided && object(decisions[reportId], `${label}.decisions.${reportId}`).action !== 'cancel';
++    validateTaskReportIdentity(report, at, task, workerId, stepIds, current, historical, resolvedContinuation);
+     if (!decided) facts.reconciliationReasons.push({ code: current ? 'report-obligation-unresolved' : 'report-resolution-ambiguous', path: at });
+     if (decided) {
+       const decision = object(decisions[reportId], `${label}.decisions.${reportId}`), payload = object(report.payload, `${at}.payload`);
+diff --git a/src/controller.js b/src/controller.js
+index 6405013..c6088dd 100644
+--- a/src/controller.js
++++ b/src/controller.js
+@@ -1329,30 +1329,45 @@ export class PairController extends EventEmitter {
+       /** @type {import('./contracts.js').ContinuationDecision} */
+       const decision = { hash, feedback: input.feedback, ownerEpoch: this.state.ownerEpoch, workerGeneration: r.workerGeneration, attemptId: t.attemptId, deliveryOperationId: uid('decision-delivery'), at: Date.now(), reviewerModel: this.mainObservation?.model || null, delivery: 'pending',
+         ...(input.action === 'approve' ? { action: input.action, checkpointHash: input.checkpointHash } : { action: input.action, checkpointHash: input.checkpointHash || null }) };
+-      t.decisions[input.reportId] = decision; t.lastDecision = { action: input.action, feedback: input.feedback, reportId: input.reportId };
+-      if (this.state.notices[input.reportId]) this.state.notices[input.reportId].status = 'resolved';
+-      if (this.state.mainPhase) this.setPhase('open');
+-      if (input.action === 'revise') { t.revisions++; t.stepRevisions = (t.stepRevisions ?? 0) + 1; }
++      // Preflight the complete next task before touching the retained task,
++      // decision notices or work-order. A rejected draft must remain resumable.
++      const proposed = clone(t);
++      proposed.decisions[input.reportId] = decision; proposed.lastDecision = { action: input.action, feedback: input.feedback, reportId: input.reportId };
++      if (input.action === 'revise') { proposed.revisions++; proposed.stepRevisions = (proposed.stepRevisions ?? 0) + 1; }
++      if (newSteps) { proposed.steps = clone(newSteps); proposed.planRevision = incrementCounter(proposed.planRevision, 'task.planRevision'); }
++      if (input.action === 'approve') {
++        proposed.baseSnapshotRef = report.snapshotRef;
++        if (finished) {
++          proposed.status = 'completed'; proposed.completedAt = Date.now(); decision.delivery = 'not_required';
++        } else if (report.payload.stepComplete !== false) { proposed.stepIndex++; proposed.stepRevisions = 0; }
++      }
++      if (!finished) {
++        assert(launch, 'Missing continuation launch');
++        this.rotateAttempt(proposed); proposed.leaseId = uid('lease'); proposed.turns = 0; proposed.status = 'activating'; delete proposed.interruption;
++      }
++      const candidate = clone(this.state); candidate.workers[r.id].task = proposed;
++      validateStoredState(candidate, { ownerSession: this.ownerSession, cwd: this.cwd });
+       if (newSteps) {
+-        t.steps = clone(newSteps); t.planRevision = incrementCounter(t.planRevision, 'task.planRevision');
+         await atomicJSON(path.join(this.workerDir(r.id), 'work-order.json'),
+-          { version: 1, taskId: t.id, planRevision: t.planRevision, objective: t.objective, context: bounded(t.context, 24000), constraints: t.constraints, writtenAt: Date.now() });
++          { version: 1, taskId: proposed.id, planRevision: proposed.planRevision, objective: proposed.objective, context: bounded(proposed.context, 24000), constraints: proposed.constraints, writtenAt: Date.now() });
++        check(); assert(launch && this.launchCurrent(launch), 'Continuation was superseded');
+       }
+-      if (input.action === 'approve') {
+-        t.baseSnapshotRef = report.snapshotRef;
+-        if (finished) {
+-          this.revoke(r.id, 'Task completed'); t.status = 'completed'; t.completedAt = Date.now();
+-          if (r.status !== 'stopped' && r.status !== 'error') r.status = 'ready';
+-          decision.delivery = 'not_required'; await this.persist(); await this.writeAuthority(r.id, 'idle');
+-          this.scheduleCollection();
+-          return { completed: true };
+-        }
+-        if (report.payload.stepComplete !== false) { t.stepIndex++; t.stepRevisions = 0; }
++      Object.assign(t, proposed);
++      if (this.state.notices[input.reportId]) this.state.notices[input.reportId].status = 'resolved';
++      if (this.state.mainPhase) this.setPhase('open');
++      if (finished) {
++        this.revoke(r.id, 'Task completed');
++        if (r.status !== 'stopped' && r.status !== 'error') r.status = 'ready';
++        await this.persist(); await this.writeAuthority(r.id, 'idle'); this.scheduleCollection(); return { completed: true };
++      }
++      assert(launch, 'Missing continuation launch'); delete t.interruption;
++      let work;
++      try { work = this.reserveWork(launch, t); }
++      catch (error) {
++        await this.interrupt(r.id, `Continuation reservation held (not retried): ${briefError(error)}`);
++        throw error;
+       }
+-      assert(launch, 'Missing continuation launch');
+-      this.rotateAttempt(t); t.leaseId = uid('lease'); t.turns = 0; t.status = 'activating'; delete t.interruption;
+-      const work = this.reserveWork(launch, t); await this.persist();
+-      return { work, decision };
++      await this.persist(); return { work, decision };
+     });
+     if (next.cancel) { await this.contain(next.cancel, input.feedback, false); await this.releaseRepoLocks(); }
+     if (next.completed) await this.releaseRepoLocks();
+diff --git a/src/util.js b/src/util.js
+index 196239a..c490e10 100644
+--- a/src/util.js
++++ b/src/util.js
+@@ -288,13 +288,22 @@ export async function acquireLock(dir, owner, { name = '.owner-lock', conflict,
+       return async () => { if (!released) { released = true; await fs.rm(lock, { recursive: true, force: true }); } };
+     } catch (e) {
+       await fs.rm(staging, { recursive: true, force: true }).catch(() => {});
+-      if (!plain(e) || !['EEXIST', 'ENOTEMPTY'].includes(String(e.code))) throw e;
++      if (!plain(e)) throw e;
++      const collision = ['EEXIST', 'ENOTEMPTY'].includes(String(e.code));
++      // Windows reports an existing-directory collision as EPERM. Do not treat
++      // arbitrary permission failures or substituted targets as stale locks.
++      if (!collision) {
++        if (process.platform !== 'win32' || e.code !== 'EPERM') throw e;
++        const target = await fs.lstat(lock).catch(() => null);
++        if (!target?.isDirectory() || target.isSymbolicLink()) throw e;
++      }
+       const previous = await readJSON(path.join(lock, 'owner.json'), null);
+       if (previous === null) {
+         const stat = await fs.stat(lock).catch(() => null);
+         assert(!stat || Date.now() - stat.mtimeMs > ORPHAN_LOCK_MS, 'Another Pair controller is initializing. Retry after it finishes.');
+       } else {
+         assert(plain(previous) && typeof previous.pid === 'number', 'Invalid Pair owner lock: pid must be a number');
++        assert(processState(previous.pid) !== 'foreign', 'Cannot prove whether the Pair lock owner has exited; lock retained');
+         assert(!await ownerAlive(previous), conflict ? conflict(previous) : `Pair session is already owned by process ${previous.pid}; never attach two controllers to one session.`);
+         await takeover?.(previous);
+       }

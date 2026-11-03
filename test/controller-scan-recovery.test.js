@@ -13,7 +13,7 @@ import { transcriptText } from '../src/transcript.js';
 
 const ZERO_USAGE = { input: 0, cacheRead: 0, cacheWrite: 0, totalInput: 0, output: 0, reportedCost: 0, unknownCostRequests: 0, requests: 0, cacheRatio: null };
 
-async function fixture() {
+async function fixture({ manual = false } = {}) {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), 'pair-scan-test-'));
   await fs.mkdir(path.join(base, 'repo', '.pi'), { recursive: true });
   // Canonicalize first: evidence snapshots bind to the realpath (e.g. /private/var on macOS).
@@ -35,6 +35,7 @@ async function fixture() {
     },
   });
   await controller.init();
+  if (manual) clearInterval(controller.timer); // the caller drives scan/followups deterministically
   const id = 'worker', spec = controller.config.workers[0];
   const task = {
     id: 'task-scan-1', workerId: id, requestId: 'req-scan-1', objective: 'Scan recovery fixture', context: 'test',
@@ -95,6 +96,146 @@ async function runScan(controller) {
   await controller.scan(jobs);
   for (const job of jobs) await job();
 }
+
+test('unconfirmed exit holds the handoff and never starts a fresh writer', async () => {
+  const { controller, task, record, runtime, base } = await fixture({ manual: true });
+  try {
+    runtime.contextFailure = { cause: 'overflow', taskId: task.id, attemptId: task.attemptId, leaseId: task.leaseId, message: 'context length exceeded' };
+    runtime.abortAndStop = async () => { runtime.closed = true; };
+    controller.exitProof = async () => ({ exited: false, pid: 424242, reason: 'exit unconfirmed' });
+    await runScan(controller); for (const followup of controller.scanFollowUps.splice(0)) await followup();
+    const handoff = JSON.parse(await fs.readFile(path.join(controller.dir, 'tasks', task.id, 'context-recovery-step-0.json'), 'utf8'));
+    assert.equal(handoff.exit.exited, false); assert.ok(handoff.issues.some(x => /exit is unconfirmed/i.test(x)));
+    assert.notEqual(record.freshSession, true); assert.equal(task.status, 'interrupted');
+  } finally { runtime.closed = true; await controller.close().catch(() => {}); await fs.rm(base, { recursive: true, force: true }); }
+});
+
+test('corrupt checkpoint blob holds recovery even when the manifest hash matches', async () => {
+  const { controller, repo, task, record, runtime, base } = await fixture({ manual: true });
+  try {
+    const before = await controller.evidence.capture(repo); await fs.writeFile(path.join(repo, 'approved.txt'), 'checkpoint');
+    const after = await controller.evidence.capture(repo), reportId = 'report-approved-corrupt';
+    const checkpoint = await controller.evidence.checkpoint(task.id, reportId, before, after, []), snapshotRef = await controller.evidence.saveSnapshot(after);
+    const report = envelope({ controller, task, record, runtime, kind: 'checkpoint', reportId }); report.attemptId = 'attempt-previous'; report.leaseId = 'lease-previous';
+    task.report = { ...report, checkpoint, snapshotRef };
+    task.decisions[reportId] = { action: 'approve', checkpointHash: checkpoint.checkpointHash, hash: digest('decision'), feedback: 'approved', ownerEpoch: controller.state.ownerEpoch, workerGeneration: 1, attemptId: report.attemptId, deliveryOperationId: 'decision-1', at: Date.now(), reviewerModel: null, delivery: 'accepted' };
+    task.lastDecision = { action: 'approve', feedback: 'approved', reportId }; await controller.persist();
+    const entry = after.entries.find(x => x.path === 'approved.txt'); assert.ok(entry?.sha);
+    await fs.writeFile(path.join(controller.dir, 'evidence', 'blobs', entry.sha), 'corrupted!');
+    runtime.contextFailure = { cause: 'overflow', taskId: task.id, attemptId: task.attemptId, leaseId: task.leaseId, message: 'context length exceeded' };
+    runtime.abortAndStop = async () => { runtime.closed = true; }; controller.exitProof = async () => ({ exited: true, pid: 424242, reason: 'fixture exit confirmed' });
+    await runScan(controller); for (const followup of controller.scanFollowUps.splice(0)) await followup();
+    const handoff = JSON.parse(await fs.readFile(path.join(controller.dir, 'tasks', task.id, 'context-recovery-step-0.json'), 'utf8'));
+    assert.ok(handoff.issues.some(x => /checkpoint.*could not be verified/i.test(x)));
+    assert.notEqual(record.freshSession, true); assert.equal(task.status, 'interrupted');
+  } finally { runtime.closed = true; await controller.close().catch(() => {}); await fs.rm(base, { recursive: true, force: true }); }
+});
+
+test('unreviewed latch discovered after overflow plus crash blocks fresh writer', async () => {
+  const { controller, repo, task, record, runtime, workerDir, base } = await fixture({ manual: true });
+  try {
+    const before = await controller.evidence.capture(repo);
+    await fs.writeFile(path.join(repo, 'approved.txt'), 'checkpoint');
+    const after = await controller.evidence.capture(repo), reportId = 'report-approved-prior';
+    const checkpoint = await controller.evidence.checkpoint(task.id, reportId, before, after, []), snapshotRef = await controller.evidence.saveSnapshot(after);
+    const report = envelope({ controller, task, record, runtime, kind: 'checkpoint', reportId }); report.attemptId = 'attempt-previous'; report.leaseId = 'lease-previous';
+    task.report = { ...report, checkpoint, snapshotRef };
+    task.decisions[reportId] = { action: 'approve', checkpointHash: checkpoint.checkpointHash, hash: digest('decision'), feedback: 'approved', ownerEpoch: controller.state.ownerEpoch, workerGeneration: 1, attemptId: report.attemptId, deliveryOperationId: 'decision-1', at: Date.now(), reviewerModel: null, delivery: 'accepted' };
+    task.lastDecision = { action: 'approve', feedback: 'approved', reportId }; await controller.persist();
+    const unresolved = envelope({ controller, task, record, runtime, kind: 'checkpoint', reportId: 'report-unreviewed' });
+    await fs.writeFile(path.join(workerDir, 'latch.json'), JSON.stringify({ ownerEpoch: unresolved.ownerEpoch, workerGeneration: unresolved.workerGeneration, leaseId: unresolved.leaseId, attemptId: unresolved.attemptId, report: unresolved }));
+    runtime.contextFailure = { cause: 'overflow', taskId: task.id, attemptId: task.attemptId, leaseId: task.leaseId, message: 'context length exceeded' };
+    runtime.fault = 'RPC terminated'; runtime.abortAndStop = async () => { runtime.closed = true; };
+    controller.exitProof = async () => ({ exited: true, pid: 424242, reason: 'fixture exit confirmed' });
+    await runScan(controller); for (const followup of controller.scanFollowUps.splice(0)) await followup();
+    const handoff = JSON.parse(await fs.readFile(path.join(controller.dir, 'tasks', task.id, 'context-recovery-step-0.json'), 'utf8'));
+    assert.equal(handoff.checkpoint.checkpointHash, checkpoint.checkpointHash);
+    assert.ok(handoff.issues.some(x => /report-unreviewed.*reconciliation/i.test(x)));
+    assert.notEqual(record.freshSession, true); assert.equal(task.status, 'interrupted');
+    assert.equal(JSON.parse(await fs.readFile(path.join(workerDir, 'latch.json'), 'utf8')).report.reportId, 'report-unreviewed');
+  } finally { runtime.closed = true; await controller.close().catch(() => {}); await fs.rm(base, { recursive: true, force: true }); }
+});
+
+test('exhausted compaction retries also save a handoff instead of retrying the old context', async () => {
+  const { controller, task, runtime, base } = await fixture({ manual: true });
+  try {
+    runtime.contextFailure = { cause: 'compaction-retries-exhausted', taskId: task.id, attemptId: task.attemptId, leaseId: task.leaseId, message: 'Auto-compaction failed: 503' };
+    runtime.abortAndStop = async () => { runtime.closed = true; };
+    controller.exitProof = async () => ({ exited: true, pid: 424242, reason: 'fixture exit confirmed' });
+    await runScan(controller); for (const followup of controller.scanFollowUps.splice(0)) await followup();
+    const handoff = JSON.parse(await fs.readFile(path.join(controller.dir, 'tasks', task.id, 'context-recovery-step-0.json'), 'utf8'));
+    assert.equal(handoff.cause, 'compaction-retries-exhausted'); assert.equal(task.status, 'interrupted');
+  } finally { runtime.closed = true; await controller.close().catch(() => {}); await fs.rm(base, { recursive: true, force: true }); }
+});
+
+test('overflow followed by a runtime fault is handed off, never retried in the old context', async () => {
+  const { controller, task, runtime, base } = await fixture({ manual: true });
+  try {
+    runtime.contextFailure = { cause: 'overflow', taskId: task.id, attemptId: task.attemptId, leaseId: task.leaseId, message: 'context length exceeded' };
+    runtime.fault = 'RPC terminated'; runtime.abortAndStop = async () => { runtime.closed = true; };
+    controller.exitProof = async () => ({ exited: true, pid: 424242, reason: 'fixture exit confirmed' });
+    await runScan(controller); for (const followup of controller.scanFollowUps.splice(0)) await followup();
+    const handoff = JSON.parse(await fs.readFile(path.join(controller.dir, 'tasks', task.id, 'context-recovery-step-0.json'), 'utf8'));
+    assert.equal(handoff.kind, 'context-recovery'); assert.equal(handoff.cause, 'overflow'); assert.equal(task.status, 'interrupted');
+    assert.ok(handoff.issues.some(x => /checkpoint/i.test(x)));
+  } finally { runtime.closed = true; await controller.close().catch(() => {}); await fs.rm(base, { recursive: true, force: true }); }
+});
+
+test('overflow preserves an honest handoff and holds when no checkpoint is available', async () => {
+  const { controller, task, record, runtime, base } = await fixture({ manual: true });
+  try {
+    const before = await fs.readFile(record.sessionFile, 'utf8');
+    runtime.contextFailure = { cause: 'overflow', taskId: task.id, attemptId: task.attemptId, leaseId: task.leaseId, message: 'context length exceeded' };
+    runtime.abortAndStop = async () => { runtime.closed = true; };
+    controller.exitProof = async () => ({ exited: true, pid: 424242, reason: 'fixture exit confirmed' });
+    await runScan(controller);
+    for (const followup of controller.scanFollowUps.splice(0)) await followup();
+    const handoff = JSON.parse(await fs.readFile(path.join(controller.dir, 'tasks', task.id, 'context-recovery-step-0.json'), 'utf8'));
+    assert.equal(handoff.taskId, task.id);
+    assert.equal(handoff.oldSession, record.sessionFile);
+    assert.equal(handoff.checkpoint, null);
+    assert.ok(handoff.issues.some(x => /checkpoint/i.test(x)));
+    assert.equal(task.status, 'interrupted');
+    assert.equal(await fs.readFile(record.sessionFile, 'utf8'), before, 'old transcript is never cleared');
+    assert.notEqual(record.freshSession, true, 'missing checkpoint cannot trigger a fresh writer');
+  } finally { runtime.closed = true; await controller.close().catch(() => {}); await fs.rm(base, { recursive: true, force: true }); }
+});
+
+test('overflow with verified checkpoint retains uncheckpointed changes and requests one fresh worker', async () => {
+  const { controller, repo, task, record, runtime, workerDir, base } = await fixture({ manual: true });
+  try {
+    const baseline = await controller.evidence.capture(repo);
+    await fs.writeFile(path.join(repo, 'approved.txt'), 'checkpoint');
+    const approved = await controller.evidence.capture(repo);
+    const reportId = 'report-approved';
+    const checkpoint = await controller.evidence.checkpoint(task.id, reportId, baseline, approved, []);
+    const snapshotRef = await controller.evidence.saveSnapshot(approved);
+    const report = envelope({ controller, task, record, runtime, kind: 'checkpoint', reportId });
+    report.attemptId = 'attempt-previous'; report.leaseId = 'lease-previous';
+    task.report = { ...report, checkpoint, snapshotRef };
+    await fs.writeFile(path.join(workerDir, 'latch.json'), JSON.stringify({ ownerEpoch: report.ownerEpoch, workerGeneration: report.workerGeneration, leaseId: report.leaseId, attemptId: report.attemptId, report }));
+    task.decisions[reportId] = { action: 'approve', checkpointHash: checkpoint.checkpointHash, hash: digest('decision'), feedback: 'approved', ownerEpoch: controller.state.ownerEpoch, workerGeneration: 1, attemptId: report.attemptId, deliveryOperationId: 'decision-1', at: Date.now(), reviewerModel: null, delivery: 'accepted' };
+    task.lastDecision = { action: 'approve', feedback: 'approved', reportId };
+    await controller.persist();
+    await fs.writeFile(path.join(repo, 'approved.txt'), 'unfinished change');
+    const oldSession = record.sessionFile, oldBytes = await fs.readFile(oldSession, 'utf8');
+    runtime.contextFailure = { cause: 'overflow', taskId: task.id, attemptId: task.attemptId, leaseId: task.leaseId, message: 'context length exceeded' };
+    runtime.abortAndStop = async () => { runtime.closed = true; };
+    controller.exitProof = async () => ({ exited: true, pid: 424242, reason: 'fixture exit confirmed' });
+    let resumes = 0, note = '';
+    controller.autoRecover = async (_id, _taskId, kind, instruction) => { resumes++; note = instruction; assert.equal(kind, 'context'); assert.equal(record.freshSession, true); return { recovered: true }; };
+    await runScan(controller);
+    for (const followup of controller.scanFollowUps.splice(0)) await followup();
+    const handoff = JSON.parse(await fs.readFile(path.join(controller.dir, 'tasks', task.id, 'context-recovery-step-0.json'), 'utf8'));
+    assert.equal(handoff.checkpoint.checkpointHash, checkpoint.checkpointHash);
+    assert.ok(handoff.uncheckpointed.includes('approved.txt'));
+    assert.equal(await fs.readFile(path.join(repo, 'approved.txt'), 'utf8'), 'unfinished change');
+    assert.equal(await fs.readFile(oldSession, 'utf8'), oldBytes);
+    assert.match(note, /handoff/i); assert.equal(resumes, 1);
+    await assert.rejects(controller.recoverContextFailure('worker', runtime.contextFailure), /EEXIST|already exists/i);
+    assert.equal(resumes, 1, 'a second handoff in the same step cannot spawn again');
+  } finally { runtime.closed = true; await controller.close().catch(() => {}); await fs.rm(base, { recursive: true, force: true }); }
+});
 
 test('cancel after confirmed process exit releases the task without masking the original runtime fault', async () => {
   const { controller, task, record, runtime, workerDir, base } = await fixture();
@@ -472,6 +613,7 @@ test('an unchanged retained latch does not rewrite state on every scan', async (
     await runScan(controller);
     assert.equal(task.status, 'review');
     await until(() => controller.state.notices[report.reportId]?.status === 'offered');
+    await controller.transaction(() => {}); // offered becomes visible before its persistence/event completes
     let persists = 0, changes = 0;
     const persist = controller.persist.bind(controller);
     controller.persist = async (...args) => { persists++; return persist(...args); };

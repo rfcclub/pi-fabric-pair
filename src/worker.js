@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { atomicJSON, assert, bounded, digest, inside, mkdirPrivate, plain, PROTOCOL, readJSON, safeId, Serial, uid } from './util.js';
 import { assertReportSize, reportSchema } from './schema.js';
+import { isActualContextOverflow } from './context-overflow.js';
 import { validateAuthority, validateLatch, validateReportEnvelope, validateReportPayload } from './contracts.js';
 import { detachedEffectDescription, detachedProviderEffect, detachingProgramCalls, ensureCacheLifetime, gateTool, guardProgramShell, guardShellCall, pairToolRoute, isDirectMutation, nativeSettings, probeNative, providerFileWrite, refusedProgramReason, requestsDetachedEffect, reviewWarmingAction, shellTimeoutNote, signedIn, toolName, toolPlacement } from './native.js';
 import { outOfScope, scopeSentence } from './scope.js';
@@ -435,14 +436,21 @@ export function registerWorker(pi, env = process.env) {
   pi.on('message_start', async event => {
     if (event.message?.role === 'assistant') speedStart = performance.now();
   });
+  let contextOverflow = false;
   pi.on('message_end', async (event, ctx) => {
     if (event.message?.role === 'assistant') {
+      contextOverflow = isActualContextOverflow(event.message, ctx.model);
       speed = addSpeedSample(speed, speedStart, performance.now(), event.message.usage);
       speedStart = null;
     }
     if (event.message?.role === 'assistant' && event.message.usage) { lastUsage = selectLastMeasuredUsage(lastUsage, event.message.usage); await telemetry(ctx); }
   });
-  pi.on('session_before_compact', async (_event, ctx) => { compacting = true; speedStart = null; await telemetry(ctx); });
+  pi.on('session_before_compact', async (event, ctx) => {
+    compacting = true; speedStart = null; await telemetry(ctx);
+    // An actually exhausted conversation gets a fresh thread, not Pi's overflow compact-and-retry.
+    // A normal threshold compact or output-length stop keeps Pi's ordinary behavior.
+    if (event.reason === 'overflow' && contextOverflow) return { cancel: true };
+  });
   /** The task state sent after the last compaction, until the queued copy is in the model's context. @type {string | null} */
   let restored = null;
   pi.on('session_compact', async (_event, ctx) => {

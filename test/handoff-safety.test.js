@@ -9,15 +9,18 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { registerMain } from '../src/main.js';
+import { PairController } from '../src/controller.js';
+import { discoverWorkspaceAssignments } from '../src/workspace-discovery.js';
+import { pairOwned } from '../src/evidence.js';
 import { DEFAULTS } from '../src/config.js';
 import { registerWorker } from '../src/worker.js';
 import { configPaths } from '../src/config.js';
 import { Evidence, verifyConfigured } from '../src/evidence.js';
 import { agentDir, digest } from '../src/util.js';
-import { validateAuthority } from '../src/contracts.js';
+import { validateAuthority, validateStoredState } from '../src/contracts.js';
 import { PiRpc } from '../src/rpc.js';
 import { PiRuntime } from '../src/actor-runtime.js';
 
@@ -70,13 +73,15 @@ async function mainFixture(run, { project, rpc = 'forbidden' } = {}) {
 /** Inject one finalized-report task + unacknowledged notice directly into durable
  * state, mirroring the exact persisted shapes finalizeReport produces, with a real
  * immutable checkpoint so pair_inspect/decide observe actual evidence. */
-async function injectReview(c, cwd, { kind = 'checkpoint', question, decisions, stepComplete, reportId = `report-${Math.random().toString(36).slice(2, 10)}`, taskId = `task-${Math.random().toString(36).slice(2, 10)}` } = {}) {
+async function injectReview(c, cwd, { kind = 'checkpoint', question, decisions, stepComplete, reportId = `report-${Math.random().toString(36).slice(2, 10)}`, taskId = `task-${Math.random().toString(36).slice(2, 10)}`, changedFixture = false } = {}) {
   const spec = c.config.workers[0];
   const status = kind === 'question' ? 'question' : kind === 'blocked' ? 'blocked' : 'review';
   const payload = { taskId, stepId: 'one', kind, summary: `Fixture ${kind} summary distinct from any question`,
     ...(question !== undefined ? { question } : {}), ...(decisions?.length ? { decisions } : {}), ...(stepComplete !== undefined ? { stepComplete } : {}) };
   const base = await c.evidence.capture(cwd);
-  const checkpoint = await c.evidence.checkpoint(taskId, reportId, base, base, []);
+  if (changedFixture) await fs.writeFile(path.join(cwd, 'retained-change.txt'), 'original checkpoint content\n');
+  const current = changedFixture ? await c.evidence.capture(cwd) : base;
+  const checkpoint = await c.evidence.checkpoint(taskId, reportId, base, current, []);
   const task = { id: taskId, workerId: spec.id, requestId: 'request-fixture', objective: 'Safety fixture', context: 'Original safety fixture context', constraints: ['fixture constraint'],
     steps: [{ id: 'one', title: 'Work', instructions: 'fixture' }], stepIndex: 0, planRevision: 1, attemptId: 'attempt-fixture', attemptNumber: 1,
     status, leaseId: 'lease-fixture', policy: structuredClone(c.config.supervision), limits: structuredClone(c.config.limits),
@@ -111,6 +116,435 @@ async function settled(f, name, params) {
 /** A held activation tells Main with a passive notice and never starts a Main turn. */
 const onlyHeldNotice = f => assert.ok(f.messages.every(([message, options]) => message.customType === 'fabric-pair.notice' && options?.triggerTurn === false), 'Main only receives a passive held-task notice');
 
+test('pair_discover is registered and reads the configured Git workspace without starting a worker', () => mainFixture(async f => {
+  const response = await tool(f, 'pair_discover');
+  assert.ok(Array.isArray(response.details));
+  assert.equal(response.details.length, 1);
+  assert.equal(response.details[0].workspace, f.cwd);
+  assert.deepEqual(response.details[0].assignments, []);
+  assert.deepEqual(response.details[0].issues, []);
+  assert.equal(Object.keys(f.controller.state.workers).length, 0);
+  const { task, reportId, taskId } = await injectReview(f.controller, f.cwd);
+  const stateFile = path.join(f.controller.dir, 'state.json'), before = await fs.readFile(stateFile);
+  const withReview = await tool(f, 'pair_discover');
+  assert.deepEqual(withReview.details[0].assignments[0].tasks, [{ workerId: 'worker', taskId, status: 'review', reportId, checkpointHash: task.report.checkpoint.checkpointHash }]);
+  assert.deepEqual(await fs.readFile(stateFile), before, 'discovery leaves stored report and its identity unchanged');
+  assert.equal(f.spawns(), 0);
+}));
+
+test('security regression: unauthorized workspace cannot inspect or adopt a retained assignment', () => mainFixture(async f => {
+  const { task, taskId, reportId } = await injectReview(f.controller, f.cwd);
+  const before = await fs.readFile(path.join(f.controller.dir, 'state.json'));
+  const report = structuredClone(task.report);
+  const forbidden = path.join(f.base, 'unconfigured-repo'); await fs.mkdir(forbidden); execFileSync('git', ['init', '-q'], { cwd: forbidden });
+  const params = { workspace: forbidden, ownerSession: f.controller.ownerSession, workerId: 'worker', taskId, reportId };
+  await assert.rejects(tool(f, 'pair_inspect_workspace', params), /workspace is not configured/i);
+  const { reportId: ignored, ...adopt } = params;
+  await assert.rejects(tool(f, 'pair_adopt', adopt), /workspace.*not configured/i);
+  assert.deepEqual(await fs.readFile(path.join(f.controller.dir, 'state.json')), before);
+  assert.deepEqual(task.report, report); assert.equal(f.spawns(), 0);
+}));
+
+test('owner transition keeps the original report producer and fences unknown or impossible epochs', () => mainFixture(async f => {
+  const { reportId } = await injectReview(f.controller, f.cwd);
+  const state = structuredClone(f.controller.state), oldOwner = state.ownerSession, oldEpoch = state.ownerEpoch;
+  state.workspaceOrigin = { cwd: state.cwd, ownerSession: oldOwner };
+  state.ownerTransitions = [{ ownerSession: oldOwner, throughEpoch: oldEpoch, changedAt: Date.now(), backupHash: 'a'.repeat(64) }];
+  state.ownerSession = 'next-owner'; state.ownerEpoch++;
+  assert.doesNotThrow(() => validateStoredState(state, { ownerSession: 'next-owner', cwd: state.cwd }));
+  const report = state.workers.worker.task.report;
+  assert.equal(report.reportId, reportId); assert.equal(report.ownerSession, oldOwner); assert.equal(report.ownerEpoch, oldEpoch);
+  report.ownerSession = 'unknown-owner';
+  assert.throws(() => validateStoredState(state, { ownerSession: 'next-owner', cwd: state.cwd }), /producer.*owner/i);
+  report.ownerSession = oldOwner; report.ownerEpoch = state.ownerEpoch;
+  assert.throws(() => validateStoredState(state, { ownerSession: 'next-owner', cwd: state.cwd }), /producer.*owner/i);
+}));
+
+test('guarded controller takeover keeps the exact review and creates no worker', () => mainFixture(async f => {
+  const old = f.controller, { task, taskId, reportId } = await injectReview(old, f.cwd, { changedFixture: true });
+  const beforeReport = structuredClone(task.report), oldOwner = old.ownerSession;
+  const target = { directory: old.dir, cwd: old.cwd, ownerSession: oldOwner, taskId, workerId: 'worker', workspace: f.cwd };
+  const create = () => new PairController({ config: old.config, cwd: f.cwd, ownerSession: 'next-main', takeover: target });
+  const concurrent = create();
+  await assert.rejects(concurrent.init(), /already owned/i);
+  await old.close();
+  const preimage = await fs.readFile(path.join(old.dir, 'state.json'), 'utf8');
+  const next = create();
+  try {
+    await next.init();
+    const restored = next.state.workers.worker.task;
+    assert.equal(restored.status, 'review'); assert.deepEqual(restored.report, beforeReport);
+    assert.equal(next.ownerSession, 'next-main'); assert.equal(next.state.ownerEpoch, beforeReport.ownerEpoch + 1);
+    assert.equal(next.state.workers.worker.freshSession, true); assert.equal(next.handles.size, 0);
+    const transition = next.state.ownerTransitions[0];
+    assert.equal(transition.ownerSession, oldOwner); assert.equal(transition.backupHash, digest(preimage));
+    assert.equal(await fs.readFile(path.join(old.dir, 'owner-history', `${transition.backupHash}.json`), 'utf8'), preimage);
+    const discovered = await discoverWorkspaceAssignments(f.cwd);
+    assert.equal(discovered.assignments[0].ownerSession, 'next-main');
+    const evidence = await next.inspect('worker', reportId, undefined, taskId);
+    assert.equal(evidence.checkpointHash, beforeReport.checkpoint.checkpointHash);
+  } finally { await next.close(); }
+}));
+
+test('takeover refuses an unconfirmed old worker without changing its retained state', () => mainFixture(async f => {
+  const old = f.controller, { taskId } = await injectReview(old, f.cwd);
+  old.state.workers.worker.pid = process.pid; await old.persist(); await old.close();
+  const stateFile = path.join(old.dir, 'state.json'), before = await fs.readFile(stateFile);
+  const target = { directory: old.dir, cwd: old.cwd, ownerSession: old.ownerSession, taskId, workerId: 'worker', workspace: f.cwd };
+  const next = new PairController({ config: old.config, cwd: f.cwd, ownerSession: 'next-main', takeover: target });
+  await assert.rejects(next.init(), /EXIT_UNCONFIRMED/i);
+  assert.deepEqual(await fs.readFile(stateFile), before); assert.equal(next.handles.size, 0);
+}));
+
+test('takeover refuses a tampered checkpoint without changing its retained state', () => mainFixture(async f => {
+  const old = f.controller, { task, taskId } = await injectReview(old, f.cwd);
+  await old.close();
+  const stateFile = path.join(old.dir, 'state.json'), before = await fs.readFile(stateFile);
+  const manifestFile = path.join(task.report.checkpoint.path, 'manifest.json');
+  const manifest = JSON.parse(await fs.readFile(manifestFile, 'utf8')); manifest.checkpointHash = '0'.repeat(64);
+  await fs.writeFile(manifestFile, JSON.stringify(manifest));
+  const target = { directory: old.dir, cwd: old.cwd, ownerSession: old.ownerSession, taskId, workerId: 'worker', workspace: f.cwd };
+  const next = new PairController({ config: old.config, cwd: f.cwd, ownerSession: 'next-main', takeover: target });
+  await assert.rejects(next.init(), /manifest identity mismatch/i);
+  assert.deepEqual(await fs.readFile(stateFile), before); assert.equal(next.handles.size, 0);
+}));
+
+test('kill during takeover before state commit leaves preimage and is safely retryable', { timeout: 30000 }, () => mainFixture(async f => {
+  const old = f.controller, { task, taskId } = await injectReview(old, f.cwd, { changedFixture: true });
+  const report = structuredClone(task.report); await old.close();
+  const stateFile = path.join(old.dir, 'state.json'), before = await fs.readFile(stateFile, 'utf8');
+  const target = { directory: old.dir, cwd: old.cwd, ownerSession: old.ownerSession, taskId, workerId: 'worker', workspace: f.cwd };
+  const paramsFile = path.join(f.base, 'takeover-params.json'); await fs.writeFile(paramsFile, JSON.stringify({ config: old.config, cwd: f.cwd, takeover: target }));
+  const helper = fileURLToPath(new URL('./helpers/crash-workspace-takeover.js', import.meta.url));
+  const child = spawnSync(process.execPath, [helper, paramsFile], { encoding: 'utf8', timeout: 15000, env: process.env });
+  assert.notEqual(child.status, 0, 'takeover child must die before committing');
+  assert.equal(await fs.readFile(stateFile, 'utf8'), before, 'old state must remain byte-exact');
+  assert.equal(await fs.readFile(path.join(old.dir, 'owner-history', `${digest(before)}.json`), 'utf8'), before);
+  const next = new PairController({ config: old.config, cwd: f.cwd, ownerSession: 'retry-main', takeover: target });
+  try { await next.init(); assert.deepEqual(next.state.workers.worker.task.report, report); assert.equal(next.state.workers.worker.task.status, 'review'); }
+  finally { await next.close(); }
+}));
+
+test('kill immediately after transfer commit is rediscoverable and safely transferable again', { timeout: 30000 }, () => mainFixture(async f => {
+  const old = f.controller, { task, taskId } = await injectReview(old, f.cwd, { changedFixture: true });
+  const report = structuredClone(task.report); await old.close();
+  const target = { directory: old.dir, cwd: old.cwd, ownerSession: old.ownerSession, taskId, workerId: 'worker', workspace: f.cwd };
+  const paramsFile = path.join(f.base, 'takeover-params.json'); await fs.writeFile(paramsFile, JSON.stringify({ config: old.config, cwd: f.cwd, takeover: target }));
+  const helper = fileURLToPath(new URL('./helpers/crash-workspace-takeover.js', import.meta.url));
+  const child = spawnSync(process.execPath, [helper, paramsFile, 'after'], { encoding: 'utf8', timeout: 15000, env: process.env });
+  assert.notEqual(child.status, 0);
+  const discovered = await discoverWorkspaceAssignments(f.cwd), assignment = discovered.assignments[0];
+  assert.equal(assignment.ownerSession, 'crashing-main');
+  const next = new PairController({ config: old.config, cwd: f.cwd, ownerSession: 'retry-after-commit', takeover: { ...target, ownerSession: assignment.ownerSession } });
+  try {
+    await next.init(); assert.equal(next.state.ownerTransitions.length, 2);
+    assert.deepEqual(next.state.workers.worker.task.report, report); assert.equal(next.state.workers.worker.task.status, 'review');
+  } finally { await next.close(); }
+}));
+
+test('one-task takeover holds a session with other unfinished assignments', () => mainFixture(async f => {
+  const old = f.controller, { taskId } = await injectReview(old, f.cwd); await old.close();
+  const stateFile = path.join(old.dir, 'state.json'), state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+  const other = structuredClone(state.workers.worker);
+  other.id = 'other'; other.bound.id = 'other'; other.task.id = 'task-other'; other.task.requestId = 'request-other';
+  other.task.workerId = 'other'; other.task.attemptId = 'attempt-other'; other.task.leaseId = 'lease-other';
+  other.task.status = 'interrupted'; other.task.report = null; other.task.pendingReport = null; other.task.decisions = {}; other.task.lastDecision = null;
+  state.workers.other = other;
+  state.requests['request-other'] = { hash: digest('request-other'), taskId: 'task-other', workerId: 'other', acceptedAt: Date.now(), status: 'interrupted' };
+  validateStoredState(state, { ownerSession: old.ownerSession, cwd: old.cwd });
+  await fs.writeFile(stateFile, JSON.stringify(state)); const before = await fs.readFile(stateFile);
+  const target = { directory: old.dir, cwd: old.cwd, ownerSession: old.ownerSession, taskId, workerId: 'worker', workspace: f.cwd };
+  const next = new PairController({ config: old.config, cwd: f.cwd, ownerSession: 'next-main', takeover: target });
+  await assert.rejects(next.init(), /multiple unfinished tasks/);
+  assert.deepEqual(await fs.readFile(stateFile), before);
+}));
+
+test('only one competing Main can take over a retained review', () => mainFixture(async f => {
+  const old = f.controller, { taskId } = await injectReview(old, f.cwd);
+  await old.close();
+  const target = { directory: old.dir, cwd: old.cwd, ownerSession: old.ownerSession, taskId, workerId: 'worker', workspace: f.cwd };
+  const first = new PairController({ config: old.config, cwd: f.cwd, ownerSession: 'first-main', takeover: target });
+  const second = new PairController({ config: old.config, cwd: f.cwd, ownerSession: 'second-main', takeover: target });
+  const outcomes = await Promise.allSettled([first.init(), second.init()]);
+  try { assert.equal(outcomes.filter(outcome => outcome.status === 'fulfilled').length, 1); assert.equal(outcomes.filter(outcome => outcome.status === 'rejected').length, 1); }
+  finally { if (outcomes[0].status === 'fulfilled') await first.close(); if (outcomes[1].status === 'fulfilled') await second.close(); }
+}));
+
+test('LoomKit link follows exact report across adoption and never changes the checklist or gate', () => mainFixture(async f => {
+  const changeDir = path.join(f.cwd, 'openspec', 'changes', 'sample-change');
+  await fs.mkdir(changeDir, { recursive: true });
+  const checklist = '- [ ] implement\n', checklistPath = path.join(changeDir, 'tasks.md');
+  await fs.writeFile(checklistPath, checklist);
+  const old = f.controller, oldOwner = old.ownerSession;
+  const { task, taskId, reportId } = await injectReview(old, f.cwd, { changedFixture: true });
+  const report = structuredClone(task.report), hash = report.checkpoint.checkpointHash;
+  const linked = await tool(f, 'pair_link_loomkit', { workerId: 'worker', taskId, workspace: f.cwd, change: 'sample-change' });
+  const linkFile = linked.details.path, relative = path.relative(f.cwd, linkFile).split(path.sep).join('/');
+  assert.equal(pairOwned(relative), true); assert.equal(pairOwned('openspec/changes/sample-change/tasks.md'), false);
+  assert.equal(pairOwned('nested/openspec/changes/sample-change/.pair-checkpoint-example.json'), false);
+  let metadata = JSON.parse(await fs.readFile(linkFile, 'utf8'));
+  assert.equal(metadata.report.reportId, reportId); assert.equal(metadata.report.checkpointHash, hash);
+  assert.equal(metadata.report.pairDecision, null); assert.equal(metadata.gateCode, 'not-inferred');
+  assert.equal((await old.evidence.capture(f.cwd)).hash, hash, 'bookkeeping must not stale the checkpoint');
+  f.ctx.sessionManager.getSessionId = () => 'loomkit-new-main'; await f.events.get('session_start')({}, f.ctx);
+  await tool(f, 'pair_adopt', { workspace: f.cwd, ownerSession: oldOwner, workerId: 'worker', taskId });
+  metadata = JSON.parse(await fs.readFile(linkFile, 'utf8'));
+  assert.equal(metadata.ownerSession, 'loomkit-new-main'); assert.equal(metadata.report.ownerSession, oldOwner);
+  assert.equal(metadata.report.checkpointHash, hash); assert.equal(metadata.taskStatus, 'review');
+  await tool(f, 'pair_inspect', { workerId: 'worker', taskId, reportId });
+  await tool(f, 'pair_decide', { workerId: 'worker', taskId, reportId, action: 'approve', feedback: 'Reviewed exact checkpoint', checkpointHash: hash });
+  metadata = JSON.parse(await fs.readFile(linkFile, 'utf8'));
+  assert.equal(metadata.report.pairDecision, 'approve'); assert.equal(metadata.gateCode, 'not-inferred');
+  assert.equal(await fs.readFile(checklistPath, 'utf8'), checklist);
+}));
+
+test('LoomKit association supports the native loomkit/ layout as well as openspec/', () => mainFixture(async f => {
+  const dir = path.join(f.cwd, 'loomkit', 'changes', 'native-change'); await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, 'tasks.md'), '- [ ] pending\n');
+  const { task, taskId } = await injectReview(f.controller, f.cwd);
+  const result = await f.controller.linkLoomkit('worker', taskId, f.cwd, 'native-change');
+  assert.equal(result.path, path.join(dir, `.pair-checkpoint-${taskId}.json`));
+  assert.equal(task.loomkit.layout, 'loomkit');
+  assert.equal(pairOwned(`loomkit/changes/native-change/.pair-checkpoint-${taskId}.json`), true);
+  assert.equal(JSON.parse(await fs.readFile(result.path, 'utf8')).report.reportId, task.report.reportId);
+  assert.equal((await f.controller.evidence.capture(f.cwd)).hash, task.report.checkpoint.checkpointHash);
+}));
+
+test('a failed LoomKit metadata sync is visible and recoverable without replacing existing files', () => mainFixture(async f => {
+  const dir = path.join(f.cwd, 'openspec', 'changes', 'sample-change'); await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, 'tasks.md'), '- [ ] pending\n');
+  const { task, taskId } = await injectReview(f.controller, f.cwd), report = structuredClone(task.report);
+  const target = path.join(dir, `.pair-checkpoint-${taskId}.json`); await fs.writeFile(target, 'user data, not Pair metadata');
+  await assert.rejects(f.controller.linkLoomkit('worker', taskId, f.cwd, 'sample-change'), /association is held/i);
+  assert.equal(await fs.readFile(target, 'utf8'), 'user data, not Pair metadata');
+  assert.ok(f.controller.summary().workers[0].task.loomkit.syncError);
+  assert.deepEqual(task.report, report); assert.equal(task.status, 'review');
+  await fs.rename(target, `${target}.human-backup`);
+  await f.controller.linkLoomkit('worker', taskId, f.cwd, 'sample-change');
+  assert.equal(f.controller.summary().workers[0].task.loomkit.syncError, null);
+  assert.equal(JSON.parse(await fs.readFile(target, 'utf8')).report.checkpointHash, report.checkpoint.checkpointHash);
+}));
+
+test('approval after takeover starts a fresh worker with LoomKit, plan and last checkpoint, not the old conversation', { timeout: 25000 }, () => mainFixture(async f => {
+  const dir = path.join(f.cwd, 'openspec', 'changes', 'sample-change'); await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, 'tasks.md'), '- [x] first\n- [ ] second\n');
+  const old = f.controller, oldOwner = old.ownerSession;
+  const { task, record, taskId, reportId } = await injectReview(old, f.cwd, { changedFixture: true });
+  const oldSessionFile = record.sessionFile, hash = task.report.checkpoint.checkpointHash;
+  task.steps.push({ id: 'two', title: 'Continue', instructions: 'Only the second authorized step.' }); await old.persist();
+  await old.linkLoomkit('worker', taskId, f.cwd, 'sample-change');
+  f.ctx.sessionManager.getSessionId = () => 'worker-new-main'; await f.events.get('session_start')({}, f.ctx);
+  await tool(f, 'pair_adopt', { workspace: f.cwd, ownerSession: oldOwner, workerId: 'worker', taskId });
+  const adopted = f.getController(), originalSend = PiRpc.prototype.send; let workPrompt = null;
+  PiRpc.prototype.send = async function(command, params, timeout, options) {
+    if (command === 'prompt' && typeof params?.message === 'string' && params.message.startsWith('FABRIC PAIR WORK ORDER')) {
+      assert.equal(options?.guard?.(), true); workPrompt = params.message; return { disposition: 'started' };
+    }
+    return originalSend.call(this, command, params, timeout, options);
+  };
+  try {
+    await tool(f, 'pair_inspect', { workerId: 'worker', taskId, reportId });
+    await tool(f, 'pair_decide', { workerId: 'worker', taskId, reportId, action: 'approve', feedback: 'Checkpoint reviewed', checkpointHash: hash });
+    await Promise.all([...adopted.activations]);
+    assert.ok(workPrompt, 'new worker received a work order');
+    assert.notEqual(adopted.state.workers.worker.sessionFile, oldSessionFile, 'new conversation, not resumed old session');
+    assert.match(workPrompt, /sample-change/); assert.match(workPrompt, /tasks\.md/);
+    assert.match(workPrompt, new RegExp(hash)); assert.match(workPrompt, /Only the second authorized step/);
+    assert.match(workPrompt, /"plan":/); assert.match(workPrompt, /"context":/);
+  } finally { PiRpc.prototype.send = originalSend; }
+}, { project: { runtime: { command: process.execPath, commandArgs: [host], inheritExtensions: false, startupTimeoutMs: 5000, requestTimeoutMs: 2000, shutdownTimeoutMs: 300 } }, rpc: 'real' }));
+
+for (const cause of ['overflow', 'compaction-retries-exhausted']) test(`confirmed ${cause} starts a fresh worker from LoomKit and approved checkpoint even with watchdog disabled`, { timeout: 35000 }, () => mainFixture(async f => {
+  const dir = path.join(f.cwd, 'openspec', 'changes', 'sample-overflow'); await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, 'tasks.md'), '- [x] first\n- [ ] second\n');
+  const c = f.controller, { task, taskId, reportId } = await injectReview(c, f.cwd, { changedFixture: true, stepComplete: true });
+  task.steps.push({ id: 'two', title: 'Continue', instructions: 'Do only the second step.' });
+  task.report.snapshotRef = await c.evidence.saveSnapshot(await c.evidence.capture(f.cwd)); await c.persist();
+  await c.linkLoomkit('worker', taskId, f.cwd, 'sample-overflow');
+  const hash = task.report.checkpoint.checkpointHash, originalSend = PiRpc.prototype.send, originalSchedule = c.scheduleScan, prompts = [];
+  c.scheduleScan = () => {}; // drive the scan and follow-up in a deterministic order below
+  let firstRpc;
+  PiRpc.prototype.send = async function (command, params, timeout, options) {
+    if (command === 'prompt' && typeof params?.message === 'string' && params.message.startsWith('FABRIC PAIR WORK ORDER')) {
+      prompts.push(params.message); if (!firstRpc) firstRpc = this; assert.equal(options?.guard?.(), true); return { disposition: 'started' };
+    }
+    return originalSend.call(this, command, params, timeout, options);
+  };
+  try {
+    await c.inspect('worker', reportId);
+    await tool(f, 'pair_decide', { workerId: 'worker', taskId, reportId, action: 'approve', feedback: 'Checkpoint reviewed', checkpointHash: hash });
+    await Promise.all([...c.activations]); assert.equal(prompts.length, 1);
+    const oldFile = c.record('worker').sessionFile, oldId = c.record('worker').sessionId;
+    await fs.writeFile(path.join(f.cwd, 'retained-change.txt'), 'unfinished worker change\n');
+    firstRpc.emit('event', { type: 'agent_start' });
+    if (cause === 'overflow') {
+      firstRpc.emit('event', { type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'maximum context length exceeded', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } });
+    } else {
+      firstRpc.emit('event', { type: 'compaction_start', reason: 'threshold' });
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        firstRpc.emit('event', { type: 'summarization_retry_scheduled', attempt, maxAttempts: 3, delayMs: 0, errorMessage: '503 temporary failure' });
+        firstRpc.emit('event', { type: 'summarization_retry_attempt_start', source: 'compaction', reason: 'threshold' });
+      }
+      firstRpc.emit('event', { type: 'summarization_retry_finished' });
+      firstRpc.emit('event', { type: 'compaction_end', reason: 'threshold', aborted: false, willRetry: false, errorMessage: 'Auto-compaction failed: 503' });
+    }
+    firstRpc.emit('event', { type: 'agent_end' }); firstRpc.emit('event', { type: 'agent_settled' });
+    const jobs = []; await c.scan(jobs); for (const job of jobs) await job();
+    for (const followup of c.scanFollowUps.splice(0)) await followup();
+    await Promise.all([...c.activations]);
+    assert.equal(prompts.length, 2, `one replacement, no overflow retry; status=${task.status}; reason=${task.interruption}; error=${c.record('worker').error}; notices=${JSON.stringify(f.notices)}`);
+    assert.notEqual(c.record('worker').sessionFile, oldFile); assert.notEqual(c.record('worker').sessionId, oldId);
+    assert.match(prompts[1], /sample-overflow/); assert.match(prompts[1], new RegExp(hash));
+    assert.match(prompts[1], /context-recovery-step-1\.json/); assert.match(prompts[1], /do not replay|never replay/i);
+    const handoff = JSON.parse(await fs.readFile(path.join(c.dir, 'tasks', taskId, 'context-recovery-step-1.json'), 'utf8')); assert.equal(handoff.cause, cause);
+    assert.equal(await fs.readFile(path.join(f.cwd, 'retained-change.txt'), 'utf8'), 'unfinished worker change\n');
+    assert.ok((await fs.readFile(oldFile, 'utf8')).includes('session-fixture'));
+  } finally { PiRpc.prototype.send = originalSend; c.scheduleScan = originalSchedule; }
+}, { project: { control: { watchdog: false }, runtime: { command: process.execPath, commandArgs: [host], inheritExtensions: false, startupTimeoutMs: 5000, requestTimeoutMs: 2000, shutdownTimeoutMs: 300 } }, rpc: 'real' }));
+
+test('an interrupted adopted task continues from LoomKit and the checkpoint in a fresh worker', { timeout: 35000 }, () => mainFixture(async f => {
+  const dir = path.join(f.cwd, 'openspec', 'changes', 'sample-change'); await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, 'tasks.md'), '- [x] first\n- [ ] second\n');
+  const old = f.controller, oldOwner = old.ownerSession;
+  const { task, taskId, reportId } = await injectReview(old, f.cwd, { changedFixture: true });
+  const hash = task.report.checkpoint.checkpointHash;
+  task.steps.push({ id: 'two', title: 'Continue', instructions: 'Do only step two.' }); await old.persist();
+  await old.linkLoomkit('worker', taskId, f.cwd, 'sample-change');
+  const originalSend = PiRpc.prototype.send, prompts = [];
+  PiRpc.prototype.send = async function(command, params, timeout, options) {
+    if (command === 'prompt' && typeof params?.message === 'string' && params.message.startsWith('FABRIC PAIR WORK ORDER')) {
+      assert.equal(options?.guard?.(), true); prompts.push(params.message); return { disposition: 'started' };
+    }
+    return originalSend.call(this, command, params, timeout, options);
+  };
+  try {
+    await tool(f, 'pair_inspect', { workerId: 'worker', taskId, reportId });
+    await tool(f, 'pair_decide', { workerId: 'worker', taskId, reportId, action: 'approve', feedback: 'First checkpoint reviewed', checkpointHash: hash });
+    await Promise.all([...old.activations]); assert.equal(prompts.length, 1);
+    const record = old.state.workers.worker, handle = old.handles.get('worker');
+    const pendingPayload = { taskId, stepId: 'two', kind: 'checkpoint', summary: 'Raw report not yet verified' };
+    const unfinished = { version: 1, reportId: 'report-unfinished', workerId: 'worker', ownerSession: oldOwner, ownerEpoch: old.state.ownerEpoch,
+      workerGeneration: record.workerGeneration, nonce: handle.nonce, sessionId: record.sessionId, leaseId: task.leaseId,
+      attemptId: task.attemptId, attemptNumber: task.attemptNumber, planRevision: task.planRevision,
+      payload: pendingPayload, payloadHash: digest(pendingPayload), createdAt: Date.now() };
+    task.pendingReport = unfinished; task.status = 'awaiting_settle'; await old.persist();
+    const oldSessionFile = record.sessionFile;
+    f.ctx.sessionManager.getSessionId = () => 'fresh-main-after-interruption'; await f.events.get('session_start')({}, f.ctx);
+    await tool(f, 'pair_adopt', { workspace: f.cwd, ownerSession: oldOwner, workerId: 'worker', taskId });
+    const adopted = f.getController();
+    assert.equal(adopted.state.workers.worker.task.status, 'interrupted'); assert.equal(adopted.state.workers.worker.freshSession, true);
+    assert.deepEqual(adopted.state.workers.worker.task.pendingReport, unfinished);
+    await tool(f, 'pair_continue', { workerId: 'worker', taskId, instruction: 'Read LoomKit status and the last checkpoint before proceeding. Do not repeat changes.' });
+    assert.equal(prompts.length, 2); assert.notEqual(adopted.state.workers.worker.sessionFile, oldSessionFile);
+    assert.match(prompts[1], /sample-change/); assert.match(prompts[1], new RegExp(hash));
+    assert.match(prompts[1], /Do only step two/); assert.match(prompts[1], /do not replay previous mutations blindly/i);
+    assert.match(prompts[1], /unfinished-unverified/);
+    const archive = JSON.parse(await fs.readFile(path.join(adopted.dir, 'tasks', taskId, `attempt-${unfinished.attemptNumber}.json`), 'utf8'));
+    assert.deepEqual(archive.pendingReport, unfinished);
+    const { checkpoint, snapshotRef, inspectedAt, ...delayed } = structuredClone(task.report); delayed.reportId = 'report-delayed-old-owner';
+    const stale = await adopted.acceptReport('worker', delayed);
+    assert.equal(stale.disposition, 'stale'); assert.equal(adopted.state.workers.worker.task.pendingReport, null);
+    assert.equal(adopted.state.workers.worker.task.report.reportId, reportId);
+  } finally { PiRpc.prototype.send = originalSend; }
+}, { project: { mainSupervision: true, runtime: { command: process.execPath, commandArgs: [host], inheritExtensions: false, startupTimeoutMs: 5000, requestTimeoutMs: 2000, shutdownTimeoutMs: 300 } }, rpc: 'real' }));
+
+test('takeover and reload work when the new Main is in a different repo', () => mainFixture(async f => {
+  const old = f.controller, { task, taskId } = await injectReview(old, f.cwd);
+  const report = structuredClone(task.report); await old.close();
+  const otherMain = path.join(f.base, 'other-main'); await fs.mkdir(otherMain); execFileSync('git', ['init', '-q'], { cwd: otherMain });
+  const config = structuredClone(old.config); config.workers[0].cwd = path.relative(otherMain, f.cwd);
+  const target = { directory: old.dir, cwd: old.cwd, ownerSession: old.ownerSession, taskId, workerId: 'worker', workspace: f.cwd };
+  const adopted = new PairController({ config, cwd: otherMain, ownerSession: 'cross-repo-main', takeover: target });
+  try {
+    await adopted.init(); assert.equal(await fs.realpath(adopted.workspaceFor(config.workers[0])), f.cwd);
+    assert.deepEqual(adopted.state.workers.worker.task.report, report);
+  } finally { await adopted.close(); }
+  const reloaded = new PairController({ config, cwd: otherMain, ownerSession: 'cross-repo-main' });
+  try { await reloaded.init(); assert.equal(reloaded.dir, old.dir); assert.deepEqual(reloaded.state.workers.worker.task.report, report); }
+  finally { await reloaded.close(); }
+}));
+
+test('takeover rejects a worker configured for a different workspace without changing state', () => mainFixture(async f => {
+  const old = f.controller, { taskId } = await injectReview(old, f.cwd); await old.close();
+  const otherMain = path.join(f.base, 'other-main'); await fs.mkdir(otherMain); execFileSync('git', ['init', '-q'], { cwd: otherMain });
+  const target = { directory: old.dir, cwd: old.cwd, ownerSession: old.ownerSession, taskId, workerId: 'worker', workspace: f.cwd };
+  const before = await fs.readFile(path.join(old.dir, 'state.json'));
+  const next = new PairController({ config: old.config, cwd: otherMain, ownerSession: 'wrong-workspace', takeover: target });
+  await assert.rejects(next.init(), /not configured for its retained workspace/);
+  assert.deepEqual(await fs.readFile(path.join(old.dir, 'state.json')), before);
+}));
+
+test('the new Main can rebind its adopted assignment after reload without redispatch', () => mainFixture(async f => {
+  const old = f.controller, oldOwner = old.ownerSession, { task, taskId } = await injectReview(old, f.cwd);
+  const report = structuredClone(task.report);
+  f.ctx.sessionManager.getSessionId = () => 'reload-main'; await f.events.get('session_start')({}, f.ctx);
+  await tool(f, 'pair_adopt', { workspace: f.cwd, ownerSession: oldOwner, workerId: 'worker', taskId });
+  const adopted = f.getController(); await adopted.close();
+  const reloaded = new PairController({ config: old.config, cwd: f.cwd, ownerSession: 'reload-main' });
+  try {
+    await reloaded.init(); assert.equal(reloaded.dir, old.dir);
+    assert.deepEqual(reloaded.state.workers.worker.task.report, report);
+    assert.equal(reloaded.state.workers.worker.task.status, 'review'); assert.equal(reloaded.handles.size, 0);
+  } finally { await reloaded.close(); }
+}));
+
+test('pair_adopt moves the retained review to a new Main and permits normal inspection and decision', () => mainFixture(async f => {
+  const old = f.controller, oldOwner = old.ownerSession;
+  const { task, taskId, reportId } = await injectReview(old, f.cwd, { changedFixture: true });
+  const report = structuredClone(task.report), hash = report.checkpoint.checkpointHash;
+  f.ctx.sessionManager.getSessionId = () => 'new-main-session';
+  await f.events.get('session_start')({}, f.ctx);
+  assert.notEqual(f.getController(), old);
+  const result = await tool(f, 'pair_adopt', { workspace: f.cwd, ownerSession: oldOwner, workerId: 'worker', taskId });
+  assert.equal(result.details.workers[0].task.status, 'review');
+  const adopted = f.getController();
+  assert.equal(adopted.dir, old.dir); assert.equal(adopted.ownerSession, 'new-main-session');
+  assert.deepEqual(adopted.state.workers.worker.task.report, report);
+  assert.equal(adopted.state.workers.worker.freshSession, true); assert.equal(adopted.handles.size, 0);
+  await tool(f, 'pair_inspect', { workerId: 'worker', taskId, reportId });
+  await tool(f, 'pair_decide', { workerId: 'worker', taskId, reportId, action: 'approve', feedback: 'Reviewed exact checkpoint', checkpointHash: hash });
+  assert.equal(adopted.state.workers.worker.task.status, 'completed');
+  assert.equal(adopted.handles.size, 0);
+}));
+
+test('a retained workspace checkpoint is inspected without changing or approving its report', () => mainFixture(async f => {
+  const old = f.controller, oldOwner = old.ownerSession;
+  const { task, taskId, reportId } = await injectReview(old, f.cwd, { changedFixture: true });
+  f.ctx.sessionManager.getSessionId = () => 'new-main-session';
+  await f.events.get('session_start')({}, f.ctx);
+  assert.notEqual(f.getController(), old);
+  const params = { workspace: f.cwd, ownerSession: oldOwner, workerId: 'worker', taskId, reportId };
+  const stateFile = path.join(old.dir, 'state.json'), before = await fs.readFile(stateFile);
+  const response = await tool(f, 'pair_inspect_workspace', params);
+  assert.equal(response.details.reportId, reportId);
+  assert.equal(response.details.ownerSession, task.report.ownerSession);
+  assert.equal(response.details.ownerEpoch, task.report.ownerEpoch);
+  assert.equal(response.details.checkpointHash, task.report.checkpoint.checkpointHash);
+  assert.deepEqual(response.details.payload, task.report.payload);
+  assert.equal(response.details.reviewAuthorized, false);
+  const fileResult = await tool(f, 'pair_inspect_workspace', { ...params, file: 'retained-change.txt' });
+  assert.equal(fileResult.details.evidence.content, 'original checkpoint content\n');
+  assert.equal(fileResult.details.evidence.checkpointHash, task.report.checkpoint.checkpointHash);
+  await assert.rejects(tool(f, 'pair_inspect_workspace', { ...params, reportId: 'other-report' }), /No matching retained report/i);
+  assert.deepEqual(await fs.readFile(stateFile), before);
+  assert.equal(f.spawns(), 0);
+  assert.equal(f.getController().handles.size, 0);
+  const manifestFile = path.join(task.report.checkpoint.path, 'manifest.json');
+  const manifest = JSON.parse(await fs.readFile(manifestFile, 'utf8')); manifest.checkpointHash = '0'.repeat(64);
+  await fs.writeFile(manifestFile, JSON.stringify(manifest));
+  await assert.rejects(tool(f, 'pair_inspect_workspace', params), /manifest identity mismatch/i);
+  await fs.unlink(manifestFile);
+  await assert.rejects(tool(f, 'pair_inspect_workspace', params));
+  assert.deepEqual(await fs.readFile(stateFile), before, 'failed inspection also leaves report unchanged');
+}));
+
+test('pair_discover deduplicates Main and worker directories within the same Git worktree', () => mainFixture(async f => {
+  await fs.mkdir(path.join(f.cwd, 'nested'));
+  const response = await tool(f, 'pair_discover');
+  assert.equal(response.details.length, 1);
+  assert.equal(response.details[0].workspace, f.cwd);
+}, { project: { workers: [{ id: 'worker', provider: 'fixture', model: 'fixture-model', effort: 'low', cwd: 'nested', readOnly: false }] } }));
+
 test('agentDir matches native tilde/absolute/relative semantics without touching profiles', () => {
   const home = os.homedir();
   assert.equal(agentDir({ PI_CODING_AGENT_DIR: '~' }), home, 'bare tilde expands to home');
@@ -132,13 +566,13 @@ test('per-command verification binds source identity and fails the check that dr
   execFileSync('git', ['add', '.'], { cwd: repo });
   execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
   const evidence = new Evidence(path.join(base, 'state'), { maxFiles: 100, maxTotalBytes: 1024 * 1024, maxArtifactBytes: 1024 * 1024 });
-  const config = { commands: [{ name: 'first', command: 'true', args: [] }, { name: 'second', command: 'true', args: [] }], requirePassing: true, timeoutMs: 5000 };
+  const config = { commands: [{ name: 'first', command: process.execPath, args: ['-e', 'process.exit(0)'] }, { name: 'second', command: process.execPath, args: ['-e', 'process.exit(0)'] }], requirePassing: true, timeoutMs: 15000 };
   try {
     // Happy path: every check runs against the same source and records its hash.
     const expected = (await evidence.capture(repo)).hash;
     const clean = await verifyConfigured(config, repo, path.join(base, 'checks-clean'), undefined, { expectedHash: expected, captureSource: async () => (await evidence.capture(repo)).hash });
     assert.equal(clean.length, 2);
-    assert.ok(clean.every(result => result.passed));
+    assert.ok(clean.every(result => result.passed), JSON.stringify(clean));
     const firstArtifact = JSON.parse(await fs.readFile(path.join(base, 'checks-clean', 'check-1.json'), 'utf8'));
     assert.equal(firstArtifact.sourceHash, expected, 'the check artifact names the source identity it ran against');
     // Drift is recorded as a failed check, not thrown, and verification stops at it. Each check starts from
@@ -363,6 +797,15 @@ async function workerFixture(run, { mode = 'final-only', order, orderRaw } = {})
 }
 
 const matchingOrder = { version: 1, taskId: 'scope-task', planRevision: 1, objective: 'Scope fixture', context: 'Original granted context for restoration', constraints: [], writtenAt: Date.now() };
+
+test('overflow cancels retry but normal length and threshold compaction are left alone', () => workerFixture(async f => {
+  const end = f.events.get('message_end'), compact = f.events.get('session_before_compact');
+  await end({ message: { role: 'assistant', stopReason: 'error', errorMessage: 'maximum context length exceeded' } }, f.ctx);
+  assert.equal((await compact({ reason: 'threshold' }, f.ctx))?.cancel, undefined);
+  assert.equal((await compact({ reason: 'overflow' }, f.ctx))?.cancel, true, 'Pi must not retry an exhausted thread');
+  await end({ message: { role: 'assistant', stopReason: 'length', usage: { input: 1000, output: 100, cacheRead: 0 } } }, f.ctx);
+  assert.equal((await compact({ reason: 'overflow' }, f.ctx))?.cancel, undefined, 'ordinary length recovery is not an overflow');
+}, { order: matchingOrder }));
 
 test('the worker restores the identity-matching original context and final-only remaining plan after compaction', () => workerFixture(async f => {
   const packet = await f.packet();

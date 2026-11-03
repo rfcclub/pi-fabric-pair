@@ -66,8 +66,8 @@ test('only Prewalk auto-arm blocks Pair; manual Prewalk stays available to Main 
 
 test('meshRootFor derives a stable absolute private root per worker directory', () => {
   const first = meshRootFor('/pair/state/workers/first'), second = meshRootFor('/pair/state/workers/second');
-  assert.equal(first, '/pair/state/workers/first/fabric/mesh');
-  assert.equal(second, '/pair/state/workers/second/fabric/mesh');
+  assert.equal(first, path.join('/pair/state/workers/first', 'fabric', 'mesh'));
+  assert.equal(second, path.join('/pair/state/workers/second', 'fabric', 'mesh'));
   assert.notEqual(first, second, 'separate worker directories get separate private namespaces');
   assert.equal(meshRootFor('/pair/state/workers/first'), first, 'the root is stable across repeated derivations');
   assert.throws(() => meshRootFor('relative/workers/first'), /absolute/);

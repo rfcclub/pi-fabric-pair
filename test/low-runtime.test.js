@@ -77,11 +77,10 @@ async function fixture(plan, runtime = {}, env = {}, lowOptions = {}) {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), 'pair-low-'));
   const home = path.join(base, 'home'), results = path.join(base, 'results.json');
   await fs.mkdir(path.join(base, 'repo', '.pi'), { recursive: true }); await fs.mkdir(home);
-  // low keeps its sessions under $HOME/.low. Point the whole fixture at this one home — the process (which is what
-  // os.homedir() reads, and so what the runtime's resume check reads) and the spawned low alike — so resume is
-  // decided by configuration rather than by mutating os.homedir() midway through a test.
-  const previousHome = process.env.HOME;
+  // Point the fixture and low at one home. Node uses USERPROFILE for os.homedir() on Windows, HOME elsewhere.
+  const previousHome = process.env.HOME, previousUserProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  if (process.platform === 'win32') process.env.USERPROFILE = home;
   await fs.writeFile(results, JSON.stringify(plan));
   const repo = await fs.realpath(path.join(base, 'repo'));
   execFileSync('git', ['init', '-q'], { cwd: repo });
@@ -105,7 +104,7 @@ async function fixture(plan, runtime = {}, env = {}, lowOptions = {}) {
   });
   await controller.init();
   const log = async () => (await fs.readFile(path.join(home, 'fake-low.jsonl'), 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
-  return { base, repo, home, controller, notices, log, previousHome };
+  return { base, repo, home, controller, notices, log, previousHome, previousUserProfile };
 }
 /** @param {() => boolean | Promise<boolean>} condition @param {string} what */
 async function until(condition, what, ms = 15000) {
@@ -116,6 +115,9 @@ async function until(condition, what, ms = 15000) {
 async function cleanup(f) {
   await f.controller.close().catch(() => {});
   if (f.previousHome === undefined) delete process.env.HOME; else process.env.HOME = f.previousHome;
+  if (process.platform === 'win32') {
+    if (f.previousUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = f.previousUserProfile;
+  }
   await fs.rm(f.base, { recursive: true, force: true }).catch(() => {});
 }
 const dispatch = { workerId: 'worker', requestId: 'req-1', objective: 'Fix add()', context: 'calc.py', constraints: [], steps };
@@ -277,17 +279,35 @@ test('while a low task runs Pair watches its status: progress, the run as the to
   } finally { await cleanup(f); }
 });
 
+test('a temporary status read failure cannot replay old transcript as new activity', async () => {
+  const f = await fixture([{ result: done, delayMs: 20000, stuck: true }]);
+  const originalOpen = fs.open;
+  try {
+    await f.controller.dispatch(dispatch);
+    const runtime = /** @type {any} */ (f.controller.handles.get('worker'));
+    await until(() => !!runtime.progress, 'the status to be read');
+    const lastEventAt = runtime.snapshot().lastEventAt; let missingReads = 0;
+    fs.open = async function (file, ...args) {
+      if (String(file).startsWith(f.home) && String(file).endsWith('status.json')) { missingReads++; throw Object.assign(new Error('temporary missing status'), { code: 'ENOENT' }); }
+      return originalOpen.call(this, file, ...args);
+    };
+    await until(() => missingReads > 0, 'the status read gap', 10000);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    assert.equal(runtime.snapshot().lastEventAt, lastEventAt, 'a vanished status is not new task activity');
+  } finally { fs.open = originalOpen; await cleanup(f); }
+});
+
 test('a low task that stands still is not kept alive by the server\'s heartbeat', async () => {
   const f = await fixture([{ result: done, delayMs: 20000, stuck: true }]);
   try {
     await f.controller.dispatch(dispatch);
     const runtime = /** @type {any} */ (f.controller.handles.get('worker'));
     await until(() => !!runtime.progress, 'the status to be read');
-    const moved = runtime.progress.movedAt;
+    const moved = runtime.progress.movedAt, lastEventAt = runtime.snapshot().lastEventAt;
     await new Promise(resolve => setTimeout(resolve, 4500));
     assert.equal(runtime.progress.movedAt, moved);
     assert.ok(runtime.progress.at > moved + 3000, 'the heartbeat went on');
-    assert.ok(runtime.snapshot().lastEventAt <= moved + 1000, 'but the last event is when the task last moved');
+    assert.equal(runtime.snapshot().lastEventAt, lastEventAt, 'heartbeats do not advance task activity');
     assert.equal(await runtime.ping(1000), true, 'a server with a fresh heartbeat still answers');
   } finally { await cleanup(f); }
 });

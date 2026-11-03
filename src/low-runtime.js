@@ -228,6 +228,9 @@ export class LowRuntime {
   get permission() { return false; }
   get currentTool() { return this.#tool?.name || null; }
   get lastError() { return this.#lastError; }
+  /** Low manages its own context; Pi overflow events do not apply. */
+  get contextOverflow() { return null; }
+  get contextFailure() { return null; }
   /** What the running task is doing, as low's last status said; null between tasks. */
   get progress() { return this.#progress; }
   /**
@@ -476,6 +479,10 @@ export class LowRuntime {
     const file = this.#sessionFile;
     if (!file || !this.#task) { clearInterval(this.#watch); this.#watch = undefined; return; }
     if (await this.#status()) { this.#wake(); return; }
+    // Once status support is observed, a transient missing/unreadable status is not
+    // evidence of activity. Falling back would replay old transcript bytes as a fresh
+    // event and incorrectly keep a stalled worker alive.
+    if (this.#statusSeen) return;
     const size = await fs.stat(file).then(s => s.size, () => this.#watchedBytes);
     if (size <= this.#watchedBytes) return;
     const start = Math.max(this.#watchedBytes, size - TAIL_BYTES);

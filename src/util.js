@@ -3,6 +3,7 @@ import { constants } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { WIRE_VERSION } from './contracts.js';
 
 export const VERSION = '0.1.0';
@@ -127,7 +128,7 @@ export function parseElapsed(text) {
   return (Number(days || 0) * 86400) + (Number(hours || 0) * 3600) + (Number(minutes) * 60) + Number(seconds);
 }
 /**
- * When a process started, from its elapsed time.
+ * When a process started: Windows reports UTC process start time; POSIX uses elapsed time.
  *
  * `ps -o lstart=` looks like the obvious source and is not: it prints a local-time string, and `Date.parse` reads
  * it in the host's zone, so on a machine whose zone differs from the one the string was rendered in — or across a
@@ -136,8 +137,18 @@ export function parseElapsed(text) {
  * @param {number} pid @returns {Promise<number | null>}
  */
 export async function processStartedAt(pid) {
-  if (process.platform === 'win32' || !Number.isSafeInteger(pid) || pid <= 0) return null;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   const { execFile } = await import('node:child_process');
+  if (process.platform === 'win32') {
+    // Get-Process obtains the OS process creation time; access denial, exit or malformed output is unknown, not proof.
+    const command = `try { $p = Get-Process -Id ${pid} -ErrorAction Stop; [DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() } catch { exit 1 }`;
+    return new Promise(resolve => {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], { timeout: 5000, windowsHide: true }, (error, stdout) => {
+        const text = stdout.trim(), value = /^[0-9]{10,16}$/.test(text) ? Number(text) : NaN;
+        resolve(!error && Number.isSafeInteger(value) && value > 0 && value <= Date.now() + 5000 ? value : null);
+      });
+    });
+  }
   return new Promise(resolve => {
     execFile('ps', ['-o', 'etime=', '-p', String(pid)], { timeout: 5000, env: { ...process.env, LC_ALL: 'C' } }, (error, stdout) => {
       const elapsed = error ? null : parseElapsed(stdout);
@@ -149,7 +160,7 @@ export async function processStartedAt(pid) {
  * Whether the process now holding `pid` started after `at`, which means the number was reused by somebody else.
  * A PID alone proves nothing: the number of a worker that crashed is free again a moment later, and any process on
  * the machine can take it. The start time is what distinguishes "the worker is still running" from "an unrelated
- * process inherited the number". `null` when the platform cannot say (Windows, or `ps` unavailable).
+ * process inherited the number". `null` when the platform cannot read the timestamp (access denied, process exit, or OS tool unavailable).
  *
  * `ps lstart` reports a start time to the second and `at` is recorded just after the spawn, so the comparison uses
  * the same 2 s tolerance `ownerAlive` does: a process that began more than that after the spawn was recorded cannot
@@ -165,7 +176,9 @@ const PROCESS_STARTED_AT = Date.now() - Math.round(process.uptime() * 1000);
 export async function ownerAlive(owner) {
   if (!plain(owner) || typeof owner.pid !== 'number') return false;
   const state = processState(owner.pid);
-  if (state !== 'alive') return false;
+  // EPERM means the PID exists but cannot be inspected; it is not proof of an exited owner.
+  if (state === 'dead') return false;
+  if (state === 'foreign') return true;
   if (typeof owner.startedAt !== 'number') return true;
   const started = await processStartedAt(owner.pid);
   return started === null || started <= owner.startedAt + 2000;
@@ -261,7 +274,7 @@ const ORPHAN_LOCK_MS = 60_000;
  * @param {string} dir
  * @param {Record<string, unknown>} owner
  * @param {{name?: string, conflict?: (owner: Record<string, unknown>) => string, takeover?: (owner: Record<string, unknown>) => Promise<void>}} [options]
- *   `takeover` runs before a dead owner's lock is removed and throws to keep it.
+ *   `takeover` runs before a dead owner's lock is reassigned and throws to keep it.
  * @returns {Promise<() => Promise<void>>}
  */
 export async function acquireLock(dir, owner, { name = '.owner-lock', conflict, takeover } = {}) {
@@ -278,17 +291,42 @@ export async function acquireLock(dir, owner, { name = '.owner-lock', conflict, 
       return async () => { if (!released) { released = true; await fs.rm(lock, { recursive: true, force: true }); } };
     } catch (e) {
       await fs.rm(staging, { recursive: true, force: true }).catch(() => {});
-      if (!plain(e) || !['EEXIST', 'ENOTEMPTY'].includes(String(e.code))) throw e;
+      const code = plain(e) ? String(e.code) : '';
+      // Windows can report EPERM/EACCES for a rename onto an existing directory. Only treat
+      // it as contention if the lock really exists as a directory; all other errors fail closed.
+      const existingDirectory = ['EPERM', 'EACCES'].includes(code) && (await fs.lstat(lock).catch(() => null))?.isDirectory();
+      if (!['EEXIST', 'ENOTEMPTY'].includes(code) && !existingDirectory) throw e;
       const previous = await readJSON(path.join(lock, 'owner.json'), null);
       if (previous === null) {
         const stat = await fs.stat(lock).catch(() => null);
-        assert(!stat || Date.now() - stat.mtimeMs > ORPHAN_LOCK_MS, 'Another Pair controller is initializing. Retry after it finishes.');
-      } else {
-        assert(plain(previous) && typeof previous.pid === 'number', 'Invalid Pair owner lock: pid must be a number');
-        assert(!await ownerAlive(previous), conflict ? conflict(previous) : `Pair session is already owned by process ${previous.pid}; never attach two controllers to one session.`);
-        await takeover?.(previous);
+        if (!stat) continue;
+        assert(Date.now() - stat.mtimeMs > ORPHAN_LOCK_MS, 'Another Pair controller is initializing. Retry after it finishes.');
+        throw new Error('Pair lock owner is missing or unreadable; ownership cannot be proven and the lock is held.');
       }
-      await fs.rm(lock, { recursive: true, force: true });
+      assert(plain(previous) && typeof previous.pid === 'number', 'Invalid Pair owner lock: pid must be a number');
+      assert(!await ownerAlive(previous), conflict ? conflict(previous) : `Pair session is already owned by process ${previous.pid}; never attach two controllers to one session.`);
+      // Serialize takeovers without ever removing the old lock directory. SQLite's OS-held
+      // transaction is released by the OS even if Main is killed during the guard; a second
+      // controller therefore cannot skip the guard or inherit an orphaned claim file.
+      let guard;
+      try {
+        guard = new DatabaseSync(path.join(dir, `${name}.takeover.sqlite`));
+        guard.exec('PRAGMA busy_timeout = 0; BEGIN IMMEDIATE');
+      } catch (error) {
+        guard?.close();
+        throw new Error(`Pair lock takeover is in progress or unavailable; the lock is held: ${briefError(error)}`);
+      }
+      try {
+        const current = await readJSON(path.join(lock, 'owner.json'), null);
+        assert(JSON.stringify(current) === JSON.stringify(previous), 'Pair lock owner changed during takeover; retry.');
+        assert(!await ownerAlive(previous), 'Pair lock owner became live during takeover; the lock is held.');
+        await takeover?.(previous);
+        await atomicJSON(path.join(lock, 'owner.json'), { ...owner, pid: process.pid, startedAt: PROCESS_STARTED_AT, createdAt: Date.now() });
+      } finally {
+        try { guard.exec('ROLLBACK'); } finally { guard.close(); }
+      }
+      let released = false;
+      return async () => { if (!released) { released = true; await fs.rm(lock, { recursive: true, force: true }); } };
     }
   }
   throw new Error('Could not acquire Pair lock');

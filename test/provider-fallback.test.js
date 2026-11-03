@@ -203,8 +203,8 @@ test('a low worker whose provider stops on quota restarts on its fallback with t
   const base = await fs.mkdtemp(path.join(os.tmpdir(), 'pair-fallback-low-'));
   const home = path.join(base, 'home'), results = path.join(base, 'results.json');
   await fs.mkdir(path.join(base, 'repo', '.pi'), { recursive: true }); await fs.mkdir(home);
-  const previousHome = process.env.HOME;
-  process.env.HOME = home;
+  const previousHome = process.env.HOME, previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; if (process.platform === 'win32') process.env.USERPROFILE = home;
   const done = { status: 'done', exit: 0, verdict: 'VERIFIED', good: true, answer: 'Done.', criteria: 'works', check: 'passed', changes: ['a.txt +1 −0'] };
   // The fake replays its script per process: the primary's server hits the quota, the fallback's finishes the step.
   const fallbackResults = path.join(base, 'fallback-results.json');
@@ -250,6 +250,7 @@ test('a low worker whose provider stops on quota restarts on its fallback with t
   } finally {
     await controller.close().catch(() => {});
     if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousUserProfile;
     await fs.rm(base, { recursive: true, force: true }).catch(() => {});
   }
 });

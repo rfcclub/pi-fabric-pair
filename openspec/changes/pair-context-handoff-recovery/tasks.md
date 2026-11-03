@@ -1,0 +1,8 @@
+# Implementation tasks: Pair context handoff recovery
+
+- [x] 1. Trace Pi's effective reserve, native retry/compaction lifecycle and existing Pair event, ownership, handoff, checkpoint and new-session paths. Document the exact counting rule and do not multiply native retries.
+- [x] 2. On actual context overflow, immediately hand off to a new thread without retrying the exhausted conversation. Retain Pi's native three-retry transient-error policy; distinguish overflow from length and cancellation. Preserve readiness/security guards.
+- [x] 3. On actual overflow or exhausted transient compaction failure, durably record handoff from existing task/LoomKit/checkpoint evidence, preserve uncheckpointed work and the old transcript, verify the old writer has stopped and use a new worker session. Fail closed on uncertain ownership or evidence; bound replacement and make interruptions idempotent.
+- [x] 4. Add targeted offline tests covering effective 33000 reserve and overrides, success, native retry budget, overflow, exhausted recovery, handoff integrity and unknowns, dead/live old writer, fresh session, stale reports, crash/retry idempotence and repeated-failure bound. Run relevant regression/type checks.
+- [x] 5. Run actual LoomKit `gate-code` on the exact candidate and independently review the changed paths/security and real evidence. Record degraded modes or unavailability; `gate-plan` remains unavailable and is not claimed as passed.
+- [x] 6. Review and perform the authorized 33000-token Pi-default setting with external SHA backup and verify effective configuration; assess local-to-installed-package rollout separately without disrupting an active Pi. Commit all reviewed Pair-repository changes after verification. Report exact local/live/commit status.

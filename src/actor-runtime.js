@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { PiRpc, RpcUncertainError, isRpcRecord } from './rpc.js';
 import { checkReadiness, meshRootFor } from './native.js';
+import { isActualContextOverflow } from './context-overflow.js';
 
 /** @typedef {import('./rpc.js').RpcRecord} RecordValue */
 /** @typedef {import('./rpc.js').RpcOptions} RpcOptions */
@@ -15,7 +16,7 @@ import { checkReadiness, meshRootFor } from './native.js';
 /** @typedef {{taskId: string, attemptId: string, leaseId: string, workerGeneration: number}} ActivationIdentity */
 /** @typedef {Readonly<ActivationIdentity & {serial: number}>} Activation */
 /** @typedef {{token: Activation, controller: AbortController, prepared: boolean, attempted: boolean, accepted: boolean, settled: boolean}} ActivationState */
-/** @typedef {{model: {provider: string, id: string}, thinkingLevel: string, sessionId: string, sessionFile: string, isStreaming: boolean, isCompacting: boolean, pendingMessageCount: number, autoCompactionEnabled: boolean}} RuntimeState */
+/** @typedef {{model: {provider: string, id: string, contextWindow?: number}, thinkingLevel: string, sessionId: string, sessionFile: string, isStreaming: boolean, isCompacting: boolean, pendingMessageCount: number, autoCompactionEnabled: boolean}} RuntimeState */
 /** @typedef {{state: RuntimeState, probe: Probe}} Readiness */
 /** @typedef {{input: number, output: number, cacheRead: number, cacheWrite: number, cost?: {total: number}}} Usage */
 /** @typedef {{type: string, at: number, message?: {role: string, usage?: Usage}, reason?: string, toolCallId?: string, toolName?: string, steering?: number, followUp?: number, error?: string, notifyType?: string}} RuntimeObservation */
@@ -267,7 +268,7 @@ function validateState(value) {
   const state = record(value, 'RPC state'), model = record(state.model, 'RPC model');
   requireValue(text(model.provider) && text(model.id) && text(state.sessionId) && text(state.sessionFile) && typeof state.thinkingLevel === 'string' && THINKING.has(state.thinkingLevel), 'Incomplete RPC state identity');
   requireValue(typeof state.isStreaming === 'boolean' && typeof state.isCompacting === 'boolean' && count(state.pendingMessageCount) && typeof state.autoCompactionEnabled === 'boolean', 'Invalid RPC idle state');
-  return { model: { provider: model.provider, id: model.id }, thinkingLevel: state.thinkingLevel, sessionId: state.sessionId, sessionFile: state.sessionFile, isStreaming: state.isStreaming, isCompacting: state.isCompacting, pendingMessageCount: state.pendingMessageCount, autoCompactionEnabled: state.autoCompactionEnabled };
+  return { model: { provider: model.provider, id: model.id, ...(typeof model.contextWindow === 'number' && Number.isFinite(model.contextWindow) && model.contextWindow > 0 ? { contextWindow: model.contextWindow } : {}) }, thinkingLevel: state.thinkingLevel, sessionId: state.sessionId, sessionFile: state.sessionFile, isStreaming: state.isStreaming, isCompacting: state.isCompacting, pendingMessageCount: state.pendingMessageCount, autoCompactionEnabled: state.autoCompactionEnabled };
 }
 /** @param {unknown} value @returns {asserts value is Probe} */
 function assertProbe(value) {
@@ -310,6 +311,9 @@ export class PiRuntime {
   #settledSequence = 0; #settledAt = 0; #serial = 0; #scope = 0; #revision = 0;
   #ready = false; #started = false; #provenUnspawned = false; #closing = false; #revokedStartup = false;
   #streaming = false; #unsettled = false; #retrying = false; #summaryRetrying = false; #overflowRecovery = false;
+  /** @type {{taskId: string, attemptId: string, leaseId: string, message: string} | null} */ #contextOverflow = null;
+  /** @type {{cause: 'compaction-retries-exhausted', taskId: string, attemptId: string, leaseId: string, message: string} | null} */ #compactionFailure = null;
+  /** @type {{attempt: number, max: number, started: boolean, finished: boolean, reason: string | null} | null} */ #summaryAttempt = null;
   #steering = 0; #followUp = 0; #idleKnown = false; #promptPending = false; #bridge = false; #rejecting = false; #reportSettling = false; #settledAborted = false;
   // Liveness: when anything last arrived, the provider retry in flight, the last provider error and how long a compaction has run.
   #lastEventAt = 0;
@@ -351,6 +355,10 @@ export class PiRuntime {
   get currentTool() { return this.#tools.values().next().value?.name || null; }
   /** The last provider error the worker reported, cleared when a new activation is accepted. */
   get lastError() { return this.#lastError; }
+  /** Actual context overflow in the last current activation, never a generic length stop. */
+  get contextOverflow() { return this.#contextOverflow; }
+  /** A definitive context failure in the current activation. */
+  get contextFailure() { return this.#contextOverflow ? { cause: /** @type {const} */ ('overflow'), ...this.#contextOverflow } : this.#compactionFailure; }
 
   /**
    * The last measured size of this worker's context, in tokens, or null when nothing was measured yet. Pi reports it
@@ -663,6 +671,7 @@ export class PiRuntime {
     requireValue(!this.#promptPending && (!this.#activation || this.#activation.settled), 'An activation is already reserved/awaiting acceptance; revoke before replacing it');
     this.#invalidateDialogs(); this.#activation?.controller.abort();
     const token = Object.freeze({ ...identity, serial: ++this.#serial });
+    this.#contextOverflow = null; this.#compactionFailure = null; this.#summaryAttempt = null;
     this.#activation = { token, controller: new AbortController(), prepared: false, attempted: false, accepted: false, settled: false };
     this.#wake(); return token;
   }
@@ -877,6 +886,7 @@ export class PiRuntime {
         break; // retain stdin; no timer or implicit stop
       case 'compaction_start': {
         requireValue(typeof event.reason === 'string' && COMPACTION_REASONS.has(event.reason), 'Invalid compaction reason');
+        this.#summaryAttempt = null;
         this.#compactions.set(event.reason, (this.#compactions.get(event.reason) || 0) + 1); this.#idleKnown = false; observation.reason = event.reason;
         if (!this.#compactingSince.has(event.reason)) this.#compactingSince.set(event.reason, Date.now());
         if (compactionMaintenance) { this.#maintenanceCompaction = true; this.#armCompactionDeadline(); }
@@ -886,6 +896,11 @@ export class PiRuntime {
         requireValue(typeof event.reason === 'string' && COMPACTION_REASONS.has(event.reason), 'Invalid compaction reason');
         requireValue(typeof event.aborted === 'boolean' && typeof event.willRetry === 'boolean', 'Invalid compaction outcome');
         const n = this.#compactions.get(event.reason) || 0;
+        const retry = this.#summaryAttempt, active = this.#activation;
+        if (n === 1 && event.reason !== 'manual' && event.result === undefined && !event.aborted && !event.willRetry && text(event.errorMessage) && retry && retry.started && retry.finished && retry.reason === event.reason && retry.max > 0 && retry.attempt >= retry.max && active?.attempted && !active.settled && this.#current(active.token)) {
+          this.#compactionFailure = { cause: 'compaction-retries-exhausted', taskId: active.token.taskId, attemptId: active.token.attemptId, leaseId: active.token.leaseId, message: event.errorMessage.slice(0, 500) };
+        }
+        this.#summaryAttempt = null;
         const exhausted = n === 0 && this.#overflowRecovery && event.reason === 'overflow' && event.result === undefined && event.aborted === false && event.willRetry === false && text(event.errorMessage);
         requireValue(n > 0 || exhausted, 'Unmatched compaction end');
         if (n === 1) this.#compactions.delete(event.reason); else if (n > 1) this.#compactions.set(event.reason, n - 1);
@@ -910,11 +925,14 @@ export class PiRuntime {
         if (event.success === false) this.#noteError(typeof event.finalError === 'string' ? event.finalError : (this.#retry?.errorMessage ?? ''), 'retry');
         else if (this.#lastError?.source === 'retry') this.#lastError = null;
         this.#retry = null; break;
-      case 'summarization_retry_scheduled': this.#summaryRetrying = true; this.#idleKnown = false; break;
+      case 'summarization_retry_scheduled':
+        if (this.#compactions.size === 1 && typeof event.attempt === 'number' && Number.isInteger(event.attempt) && event.attempt > 0 && typeof event.maxAttempts === 'number' && Number.isInteger(event.maxAttempts) && event.maxAttempts > 0) this.#summaryAttempt = { attempt: event.attempt, max: event.maxAttempts, started: false, finished: false, reason: null };
+        this.#summaryRetrying = true; this.#idleKnown = false; break;
       case 'summarization_retry_attempt_start':
         requireValue(event.source === 'branchSummary' || (event.source === 'compaction' && typeof event.reason === 'string' && COMPACTION_REASONS.has(event.reason)), 'Invalid summarization retry source');
+        if (event.source === 'compaction' && typeof event.reason === 'string' && this.#compactions.has(event.reason) && this.#summaryAttempt) { this.#summaryAttempt.started = true; this.#summaryAttempt.reason = event.reason; }
         this.#summaryRetrying = true; this.#idleKnown = false; break;
-      case 'summarization_retry_finished': this.#summaryRetrying = false; break;
+      case 'summarization_retry_finished': if (this.#summaryAttempt?.started) this.#summaryAttempt.finished = true; this.#summaryRetrying = false; break;
       case 'queue_update':
         requireValue(Array.isArray(event.steering) && event.steering.every(v => typeof v === 'string') && Array.isArray(event.followUp) && event.followUp.every(v => typeof v === 'string'), 'Invalid queue_update');
         this.#steering = event.steering.length; this.#followUp = event.followUp.length;
@@ -941,6 +959,12 @@ export class PiRuntime {
       case 'message_end': {
         const message = record(event.message, 'Message event');
         if (message.role !== 'assistant') return;
+        const active = this.#activation;
+        if (active?.attempted && !active.settled && this.#current(active.token)) {
+          this.#contextOverflow = isActualContextOverflow(message, this.#state?.model)
+            ? { taskId: active.token.taskId, attemptId: active.token.attemptId, leaseId: active.token.leaseId, message: typeof message.errorMessage === 'string' ? message.errorMessage.slice(0, 500) : 'Context usage exceeded the model window' }
+            : null;
+        }
         // The common shape of a provider failure in this setup: the turn ends with stopReason 'error'.
         if (message.stopReason === 'error') this.#noteError(message.errorMessage, 'assistant');
         observation.message = { role: 'assistant', usage: usageOf(message.usage) }; break;

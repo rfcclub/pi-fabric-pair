@@ -191,8 +191,10 @@ test('symlink ancestors are still rejected fail-closed', async () => {
 test('index parsing tolerates multiple merge stages, odd filenames and a replaced conflicted path', async () => {
   const { base, repo, evidence } = await fixture();
   try {
-    const weird = 'sp ace\tname';
-    const newline = 'new\nline';
+    // Windows forbids control characters in filenames; keep spaces and Unicode there,
+    // while retaining the tab/newline cases on platforms that support them.
+    const weird = process.platform === 'win32' ? 'sp ace 名' : 'sp ace\tname';
+    const newline = process.platform === 'win32' ? 'other ünicode' : 'new\nline';
     await fs.writeFile(path.join(repo, weird), 'weird\n');
     await fs.writeFile(path.join(repo, newline), 'newline\n');
     await fs.writeFile(path.join(repo, 'f'), 'one\n');
@@ -216,8 +218,8 @@ test('index parsing tolerates multiple merge stages, odd filenames and a replace
     const entries = byPath(current);
     assert.deepEqual(entries.get('f'), { path: 'f', ...MISSING }, 'the multi-stage path replaced by a directory is missing, not a submodule');
     assert.equal(entries.get('f/g.txt').kind, 'file');
-    assert.equal(entries.get(weird).kind, 'file', 'tab-containing names are captured');
-    assert.equal(entries.get(newline).kind, 'file', 'newline-containing names are captured');
+    assert.equal(entries.get(weird).kind, 'file', 'unusual first filename is captured');
+    assert.equal(entries.get(newline).kind, 'file', 'unusual second filename is captured');
   } finally {
     await fs.rm(base, { recursive: true, force: true }).catch(() => {});
   }

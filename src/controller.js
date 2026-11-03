@@ -24,9 +24,12 @@ import { addUsage, effectiveCaps, limitExceeded, normalizedUsage } from './metri
 import { decisionEntry, noteEntry, normalizeActivity, normalizeTimeline, reportEntry } from './timeline.js';
 import { lowMessages, transcriptText } from './transcript.js';
 import { outOfScope } from './scope.js';
+import { discoverWorkspaceAssignments } from './workspace-discovery.js';
+import { prepareWorkspaceTransfer } from './workspace-transfer.js';
+import { loomkitLayout, loomkitLinkPath, syncLoomkitLink } from './loomkit-link.js';
 import { classifyLiveness, livenessLine } from './liveness.js';
 import { classifyProviderError, providerWaitText, providerWaitsLeft, retryClock } from './provider.js';
-import { acquireLock, agentDir, assert, atomicJSON, bounded, briefError, canonical, clone, digest, inside, mkdirPrivate, pidWasReused, processStartedAt, processState, PROTOCOL, signalGroup, signallablePid, readJSON, readJsonlTail, safeId, Serial, stableDigest, uid } from './util.js';
+import { acquireLock, agentDir, assert, atomicJSON, bounded, briefError, canonical, clone, digest, inside, mkdirPrivate, pidWasReused, plain, processStartedAt, processState, PROTOCOL, signalGroup, signallablePid, readJSON, readJsonlTail, safeId, Serial, stableDigest, uid } from './util.js';
 
 /**
  * @typedef {import('./contracts.js').StoredWorkerV1} WorkerRecord
@@ -283,15 +286,16 @@ export async function currentWorkspace(live, report, load) {
 }
 
 export class PairController extends EventEmitter {
-  /** @param {{config: Parameters<typeof validateConfig>[0], cwd: string, ownerSession: string, sourcePaths?: string[], storageDir?: string, scanIntervalMs?: number, callbacks?: ControllerCallbacks, rpcFactory?: (options: import('./rpc.js').RpcOptions) => PiRpc, spawnLow?: import('./low-runtime.js').LowRuntimeOptions['spawnLow'], lowOptions?: {now?: () => number, heartbeatMs?: number, beforePublish?: () => void | Promise<void>}}} options */
-  constructor({ config, cwd, ownerSession, sourcePaths = [], storageDir, scanIntervalMs = 2000, callbacks = {}, rpcFactory = opts => new PiRpc(opts), spawnLow, lowOptions = {} }) {
+  /** @param {{config: Parameters<typeof validateConfig>[0], cwd: string, ownerSession: string, sourcePaths?: string[], storageDir?: string, takeover?: {directory: string, cwd: string, ownerSession: string, taskId: string, workerId: string, workspace: string}, scanIntervalMs?: number, callbacks?: ControllerCallbacks, rpcFactory?: (options: import('./rpc.js').RpcOptions) => PiRpc, spawnLow?: import('./low-runtime.js').LowRuntimeOptions['spawnLow'], lowOptions?: {now?: () => number, heartbeatMs?: number, beforePublish?: () => void | Promise<void>}}} options */
+  constructor({ config, cwd, ownerSession, sourcePaths = [], storageDir, takeover, scanIntervalMs = 2000, callbacks = {}, rpcFactory = opts => new PiRpc(opts), spawnLow, lowOptions = {} }) {
     super();
     /** @type {PairConfig} */ this.config = validateConfig(config);
     /** @type {PairConfig | null} */
-    this.pendingConfig = null; this.cwd = cwd; this.ownerSession = String(ownerSession);
+    this.pendingConfig = null; this.cwd = cwd; this.mainCwd = cwd; this.ownerSession = String(ownerSession); this.takeover = takeover;
     /** @type {import('./contracts.js').StoredStateV1} */ this.state = { version: STATE_VERSION, ownerSession: this.ownerSession, ownerEpoch: 0, cwd, workers: {}, requests: {}, notices: {} };
     /** @type {Evidence | null} */ this._evidence = null;
     this.sources = sourcePaths; this.callbacks = callbacks; this.rpcFactory = rpcFactory; this.spawnLow = spawnLow;
+    /** @type {Map<string, string>} */ this.loomkitErrors = new Map();
     // LowRuntime's own options (a test's clock or heartbeat window). Production passes none: the defaults apply.
     this.lowOptions = lowOptions;
     /** @type {Map<string, boolean>} */
@@ -323,14 +327,42 @@ export class PairController extends EventEmitter {
   }
   async init() {
     assert(this.ownerSession && this.ownerSession !== 'undefined', 'A real Main session identity is required');
-    this.cwd = await canonical(this.cwd);
-    this.dir = this.storageDir || path.join(agentDir(), 'fabric-pair', 'sessions', digest(`${this.cwd}\0${this.ownerSession}`).slice(0, 32));
+    this.mainCwd = await canonical(this.mainCwd);
+    this.cwd = this.mainCwd;
+    if (this.takeover) {
+      assert(!this.storageDir, 'Workspace takeover cannot use a custom state directory.');
+      const target = this.takeover, sessionsDir = path.join(agentDir(), 'fabric-pair', 'sessions');
+      assert(path.dirname(path.resolve(target.directory)) === path.resolve(sessionsDir), 'Retained state is outside Pair session storage.');
+      const found = await discoverWorkspaceAssignments(target.workspace, { sessionsDir });
+      const matches = found.assignments.filter(a => a.directory === target.directory && a.cwd === target.cwd && a.ownerSession === target.ownerSession
+        && a.tasks.some(t => t.workerId === target.workerId && t.taskId === target.taskId));
+      assert(matches.length === 1, 'The retained workspace assignment changed or is ambiguous.');
+      this.cwd = await canonical(target.cwd); this.dir = target.directory;
+    } else {
+      this.dir = this.storageDir || path.join(agentDir(), 'fabric-pair', 'sessions', digest(`${this.cwd}\0${this.ownerSession}`).slice(0, 32));
+      if (!this.storageDir) {
+        // A prior takeover deliberately keeps its origin directory. Rebinding the same Main after
+        // reload must follow that durable assignment instead of inventing an empty session state.
+        const roots = [...new Set([this.mainCwd, ...this.config.workers.map(worker => this.workspaceFor(worker))])];
+        const found = await Promise.all(roots.map(root => discoverWorkspaceAssignments(root).catch(() => ({ assignments: [] }))));
+        const matches = new Map(found.flatMap(result => result.assignments).filter(item => item.ownerSession === this.ownerSession).map(item => [item.directory, item]));
+        assert(matches.size <= 1, 'This Main session owns multiple retained assignments; discover and inspect them before continuing.');
+        const existing = [...matches.values()][0];
+        if (existing) { this.cwd = await canonical(existing.cwd); this.dir = existing.directory; }
+      }
+    }
     this.releaseLock = await acquireLock(this.dir, { ownerSession: this.ownerSession, cwd: this.cwd });
     try {
-    const loaded = await readJSON(path.join(this.dir, 'state.json'), { version: STATE_VERSION, ownerSession: this.ownerSession, ownerEpoch: 0, cwd: this.cwd, workers: {}, requests: {}, notices: {} });
-    const migrated = migrateStoredState(loaded);
-    this.state = validateStoredState(migrated.state, { ownerSession: this.ownerSession, cwd: this.cwd });
-    this.state.ownerEpoch = incrementCounter(this.state.ownerEpoch, 'state.ownerEpoch');
+    if (this.takeover) {
+      const prepared = await prepareWorkspaceTransfer(this, this.takeover);
+      for (const root of new Set(Object.values(this.state.workers).filter(activeTask).map(record => record.repoRoot))) await this.ensureRepoLock(root);
+      this.state = prepared.state;
+    } else {
+      const loaded = await readJSON(path.join(this.dir, 'state.json'), { version: STATE_VERSION, ownerSession: this.ownerSession, ownerEpoch: 0, cwd: this.cwd, workers: {}, requests: {}, notices: {} });
+      const migrated = migrateStoredState(loaded);
+      this.state = validateStoredState(migrated.state, { ownerSession: this.ownerSession, cwd: this.cwd });
+      this.state.ownerEpoch = incrementCounter(this.state.ownerEpoch, 'state.ownerEpoch');
+    }
     for (const notice of Object.values(this.state.notices)) if (notice.status === 'delivery_pending') notice.status = 'pending';
     for (const record of Object.values(this.state.workers)) {
       if (record.status !== 'stopped') {
@@ -356,11 +388,11 @@ export class PairController extends EventEmitter {
     this.timer = setInterval(() => this.scheduleScan(), this.scanIntervalMs); this.timer.unref?.();
     await this.checkWorkspaces();
     return this;
-    } catch (error) { await this.releaseLock?.(); this.releaseLock = null; throw error; }
+    } catch (error) { await this.releaseRepoLocks(true); await this.releaseLock?.(); this.releaseLock = null; throw error; }
   }
   get evidence() { assert(this._evidence, 'Controller is not initialized'); return this._evidence; }
   /** @param {import('./contracts.js').WorkerSpec} spec @returns {string} */
-  workspaceFor(spec) { return spec.cwd ? path.resolve(this.cwd, spec.cwd) : this.cwd; }
+  workspaceFor(spec) { return spec.cwd ? path.resolve(this.mainCwd, spec.cwd) : this.mainCwd; }
   async checkWorkspaces() {
     const paths = [...new Set(this.config.workers.map(spec => this.workspaceFor(spec)))];
     const results = await Promise.all(paths.map(async cwd => /** @type {[string, boolean]} */ ([cwd, await repositoryRoot(cwd).then(() => true, () => false)])));
@@ -439,7 +471,18 @@ export class PairController extends EventEmitter {
     for (const r of Object.values(this.state.workers)) { if (r.task && this.state.requests[r.task.requestId]) this.state.requests[r.task.requestId].status = r.task.status; }
     const snapshot = clone(this.state);
     validateStoredState(snapshot, { ownerSession: this.ownerSession, cwd: this.cwd });
-    await this.persistSerial.run(() => atomicJSON(path.join(this.dir, 'state.json'), snapshot));
+    await this.persistSerial.run(async () => {
+      await atomicJSON(path.join(this.dir, 'state.json'), snapshot);
+      for (const worker of Object.values(snapshot.workers)) {
+        const task = worker.task; if (!task?.loomkit) continue;
+        try { await syncLoomkitLink(snapshot, worker); this.loomkitErrors.delete(task.id); }
+        catch (error) {
+          const message = briefError(error), previous = this.loomkitErrors.get(task.id);
+          this.loomkitErrors.set(task.id, message);
+          if (previous !== message) this.notifyUser(`Pair LoomKit link for ${task.id} failed: ${message}. Task and checkpoint remain intact; retry the link.`, 'warning');
+        }
+      }
+    });
     this.emit('change', this.summary());
   }
   summary() {
@@ -455,7 +498,7 @@ export class PairController extends EventEmitter {
           status: h?.permission ? 'permission' : r?.status || 'not_started', pid: h?.pid || null,
           sessionId: r?.sessionId || null, sessionFile: r?.sessionFile || null, workerGeneration: r?.workerGeneration || null, cwd: r?.cwd || spec.cwd || this.cwd,
           workspaceGit: this.workspaceGit.get(this.workspaceFor(spec)) ?? null,
-          task: task ? taskSummary(task) : null,
+          task: task ? { ...taskSummary(task), ...(task.loomkit ? { loomkit: { ...task.loomkit, path: loomkitLinkPath(task.loomkit, task.id), syncError: this.loomkitErrors.get(task.id) || null } } : {}) } : null,
           observation: (h && this.runtimeData.get(h)?.telemetry) || r?.lastObservation || null, usage: r?.usage || null,
           lastExchange: r?.lastExchange || null, error: r?.error || null,
           // What the worker is doing right now (and for how long): no pids or paths beyond what summary already has.
@@ -940,16 +983,26 @@ export class PairController extends EventEmitter {
   /** @param {string} repoRoot */
   async ensureRepoLock(repoRoot) {
     if (this.repoLocks.has(repoRoot)) return;
+    // A clean Main shutdown can release its lock while an assignment remains in review. Discover
+    // retained work as well as the lock, so an empty lock path never authorizes a duplicate writer.
+    if (!this.storageDir) {
+      const found = await discoverWorkspaceAssignments(repoRoot);
+      const held = found.assignments.filter(assignment => path.resolve(assignment.directory) !== path.resolve(this.dir));
+      assert(!held.length, `Another retained Pair assignment still holds ${repoRoot}. Use pair_discover and transfer it before starting another writer.`);
+    }
     const base = this.storageDir ? path.join(path.dirname(this.storageDir), 'repositories') : path.join(agentDir(), 'fabric-pair', 'repositories');
     const release = await acquireLock(path.join(base, digest(repoRoot).slice(0, 32)), { repoRoot, ownerSession: this.ownerSession, stateDir: this.dir }, {
       name: '.writer-lock',
       conflict: owner => `Another Pair session (process ${owner.pid}${typeof owner.ownerSession === 'string' ? `, Main session ${owner.ownerSession}` : ''}) has an unresolved task writing ${repoRoot}. Finish or cancel it there first: two workers must not write one repository.`,
       // A Main that crashed leaves its lock behind with its task still unresolved in its own state.
       takeover: async owner => {
-        if (typeof owner.stateDir !== 'string' || owner.stateDir === this.dir) return;
-        const state = /** @type {{workers?: Record<string, WorkerRecord>} | null} */ (await readJSON(path.join(owner.stateDir, 'state.json'), null).catch(() => null));
-        const held = Object.values(state?.workers || {}).some(r => activeTask(r) && r.repoRoot === repoRoot);
-        assert(!held, `Main session ${owner.ownerSession} ended with an unresolved Pair task writing ${repoRoot}. Reopen it (pi --session ${owner.ownerSession}) and resume or cancel the task with /pair first: two workers must not write one repository. To abandon that task instead, delete ${owner.stateDir}.`);
+        assert(typeof owner.stateDir === 'string' && typeof owner.ownerSession === 'string', 'Prior writer identity is incomplete; the repository lock stays held.');
+        if (owner.stateDir === this.dir) return;
+        const saved = await readJSON(path.join(owner.stateDir, 'state.json'), null);
+        assert(plain(saved) && typeof saved.cwd === 'string', 'Prior writer state is missing or unreadable; the repository lock stays held.');
+        const state = validateStoredState(migrateStoredState(saved).state, { ownerSession: owner.ownerSession, cwd: saved.cwd });
+        const held = Object.values(state.workers).some(r => activeTask(r) && r.repoRoot === repoRoot);
+        assert(!held, `A retained Pair task still holds ${repoRoot}. Use pair_discover to locate its task and checkpoint; do not delete state or dispatch another writer before ownership transfer and checkpoint review.`);
       }
     });
     this.repoLocks.set(repoRoot, release);
@@ -1054,21 +1107,25 @@ export class PairController extends EventEmitter {
       ...(Array.isArray(step?.acceptance) && step.acceptance.length ? [`Acceptance criteria (report each with pair_report's acceptance: {criterion, met, evidence}):\n${step.acceptance.map((line, index) => `  ${index + 1}. ${line}`).join('\n')}`] : [])
     ].join('\n');
     return `FABRIC PAIR WORK ORDER\n${JSON.stringify({ ownerEpoch: this.state.ownerEpoch, workerGeneration: this.record(task.workerId).workerGeneration, taskId: task.id, planRevision: task.planRevision, attemptId: task.attemptId, attemptNumber: task.attemptNumber, objective: task.objective, constraints: task.constraints,
-      authorizedStep: task.steps[task.stepIndex], ...(first ? { plan: this.visiblePlan(task), context: task.context } : {}),
+      authorizedStep: task.steps[task.stepIndex], ...(first ? { plan: this.visiblePlan(task), context: task.context,
+        ...(task.loomkit ? { loomkit: { ...task.loomkit, tasksFile: path.join(task.loomkit.workspace, task.loomkit.layout || 'openspec', 'changes', task.loomkit.change, 'tasks.md'), instruction: 'Read the approved LoomKit plan and checklist. If they conflict with the authorized step, stop and ask Main; never mark work or gates complete solely from a Pair checkpoint.' } } : {}),
+        ...(task.report ? { lastCheckpoint: { reportId: task.report.reportId, checkpointHash: task.report.checkpoint.checkpointHash, checkpointPath: task.report.checkpoint.path, originalOwnerSession: task.report.ownerSession } } : {}),
+        ...(task.pendingArchives?.length ? { unfinishedReports: task.pendingArchives, unfinishedReportsStatus: 'unverified; inspect but do not treat as a checkpoint' } : {}) } : {}),
       supervision: task.policy.mode, ...(task.policy.mode === 'every-step' && 'maxStepFiles' in task.policy ? { maxStepFiles: task.policy.maxStepFiles } : {}), summaryDetail: task.policy.summaryDetail, finalStep: task.policy.mode === 'final-only' || task.stepIndex === task.steps.length - 1,
       lastDecision: task.lastDecision || null })}${stepControls ? `\nSTEP CONTROLS\n${stepControls}` : ''}${this.commandRule(task.workerId)}\nUse Fabric/Fovea and finish by calling pair_report. ${task.policy.mode === 'final-only' ? 'All listed steps are authorized; request review after the complete plan, and ask questions whenever needed.' : `Only the current step is authorized. Report a checkpoint before advancing.`}`;
   }
   /**
    * @param {TaskRecord} task @param {{reportId: string, action: string, feedback: string, steps?: unknown[]}} input
    * @param {string[] | null} [changedSince] files changed after the report, when an answer or revise accepted them
+   * @param {boolean} [fresh] whether this is a new worker conversation
    */
-  decisionMessage(task, input, changedSince = null) {
+  decisionMessage(task, input, changedSince = null, fresh = false) {
     const revised = input.steps ? { revisedPlan: this.visiblePlan(task), planRevision: task.planRevision } : {};
     const changed = changedSince ? { workspaceChanged: changedSince.slice(0, 200), ...(changedSince.length > 200 ? { workspaceChangedTotal: changedSince.length } : {}) } : {};
     const note = !changedSince ? ''
       : changedSince.length ? '\nThe workspace changed after your report: workspaceChanged lists the files Main or the human edited. Read them before continuing, build on them, and do not revert them unless the feedback says so.'
       : '\nThe workspace changed after your report, but Pair could not list the files. Run git status and read what changed before continuing; do not revert it unless the feedback says so.';
-    return `${this.workMessage(task)}\nMAIN DECISION\n${JSON.stringify({ reportId: input.reportId, action: input.action, feedback: input.feedback, ...revised, ...changed })}\nThe feedback field is Main's instruction for the authorized step only; it grants nothing beyond authorizedStep.${note}`;
+    return `${this.workMessage(task, fresh)}\nMAIN DECISION\n${JSON.stringify({ reportId: input.reportId, action: input.action, feedback: input.feedback, ...revised, ...changed })}\nThe feedback field is Main's instruction for the authorized step only; it grants nothing beyond authorizedStep.${note}`;
   }
   /** @param {TaskRecord} task */
   rotateAttempt(task) { task.attemptNumber = incrementCounter(task.attemptNumber, 'task.attemptNumber'); task.attemptId = uid('attempt'); }
@@ -1530,6 +1587,14 @@ export class PairController extends EventEmitter {
     if (r.status === 'error') return changed; // explicit control/start failure already owns containment
     if ((h.fault || h.closed || data.configHash !== this.configHash()) && !data.failureHandled) {
       data.failureHandled = true;
+      const overflow = h.contextFailure;
+      if ((h.fault || h.closed) && data.configHash === this.configHash() && t?.status === 'running' && overflow && overflow.taskId === t.id && overflow.attemptId === t.attemptId && overflow.leaseId === t.leaseId) {
+        const reason = `Context recovery (${overflow.cause}): preserve handoff and continue in a fresh worker thread.`;
+        const control = await this.interrupt(id, reason);
+        jobs.push(() => this.contain(control, reason, true));
+        this.queueContextRecovery(id, t, overflow);
+        return true;
+      }
       const control = await this.interrupt(id, h.fault || (h.closed ? 'Worker exited; conversation retained. Explicitly stop/reconcile before resuming.' : 'Configuration changed; current authority is held.'));
       jobs.push(() => this.contain(control, 'Runtime fault/configuration drift', true));
       this.notifyUser(`[${id}] ${r.error}. The task is held and the conversation kept: inspect the changes, then /pair stop ${id} and /pair resume ${id}.`, 'error');
@@ -1573,7 +1638,12 @@ export class PairController extends EventEmitter {
       else this.notifyUser(`[${id}] Telemetry ingestion failed after revocation: ${briefError(error)}`, 'error');
       return changed; // retain offending bytes; containment owns this generation
     }
-    let retainedReport = false;
+    let retainedReport = false, overflowReportBlocked = false;
+    /** @param {ReturnType<typeof validateReportEnvelope>} incoming @param {ReportAcceptance} accepted */
+    const previousApprovedCheckpoint = (incoming, accepted) => {
+      const decision = t?.decisions[incoming.reportId];
+      return accepted.disposition === 'duplicate' && !!t && incoming.attemptId !== t.attemptId && t.report?.reportId === incoming.reportId && decision?.action === 'approve' && decision.checkpointHash === t.report.checkpoint.checkpointHash;
+    };
     const files = (await fs.readdir(path.join(h.dir, 'inbox')).catch(error => {
       if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
       throw error;
@@ -1589,6 +1659,7 @@ export class PairController extends EventEmitter {
         const accepted = await this.acceptReport(id, incoming, control); control = accepted.control;
         if (!current()) return changed;
         retainedReport = true;
+        if (!previousApprovedCheckpoint(incoming, accepted)) overflowReportBlocked = true;
         if (accepted.disposition === 'unproven') { changed = r.staleReports !== staleBefore || changed; continue; }
         try { await fs.link(file, archive); }
         catch (error) {
@@ -1615,6 +1686,7 @@ export class PairController extends EventEmitter {
         const latch = validateLatch(raw); retainedReport = true;
         const staleBefore = r.staleReports;
         const accepted = await this.acceptReport(id, latch.report, control); control = accepted.control;
+        if (!previousApprovedCheckpoint(latch.report, accepted)) overflowReportBlocked = true;
         if (!current()) return changed;
         if (accepted.disposition === 'accepted' || r.staleReports !== staleBefore) changed = true;
       }
@@ -1679,6 +1751,14 @@ export class PairController extends EventEmitter {
         // A pause that does not say what the worker was doing is a pause nobody can act on.
         this.scanNotices.push(() => this.superviseMain('paused', id, t, `${limit} (${livenessLine(this.workerLiveness(id))})`)); this.scanNotices.push(() => this.taskSettled(t));
       } else if (t.dispatchSettleSequence !== undefined && latchSequence > t.dispatchSettleSequence) {
+        const overflow = h.contextFailure;
+        if (!overflowReportBlocked && overflow && overflow.taskId === t.id && overflow.attemptId === t.attemptId && overflow.leaseId === t.leaseId) {
+          const reason = `Context recovery (${overflow.cause}): preserve handoff and continue in a fresh worker thread.`;
+          const overflowControl = await this.interrupt(id, reason);
+          jobs.push(() => this.contain(overflowControl, reason, true));
+          this.queueContextRecovery(id, t, overflow);
+          return true;
+        }
         // A provider failure is the usual reason a run ends without a report: name it instead of saying nothing.
         const providerError = h.snapshot().lastError?.message;
         const reason = retainedReport ? 'Worker ended without an admissible current pair_report. Inspect the retained latch/report; no automatic recovery is authorized.'
@@ -1732,6 +1812,16 @@ export class PairController extends EventEmitter {
       }
     }
     return changed;
+  }
+  /** @param {string} id @param {TaskRecord} task @param {{cause: 'overflow' | 'compaction-retries-exhausted', taskId: string, attemptId: string, leaseId: string, message: string}} overflow */
+  queueContextRecovery(id, task, overflow) {
+    this.scanFollowUps.push(async () => {
+      try { await this.recoverContextFailure(id, overflow); }
+      catch (error) {
+        const why = `Context recovery handoff held: ${briefError(error)}`;
+        this.notifyUser(`[${id}] ${why}`, 'error'); this.superviseMain('stuck', id, task, why);
+      }
+    });
   }
   /** @param {string} id @param {unknown} value @param {Control} [control] @returns {Promise<ReportAcceptance>} */
   async acceptReport(id, value, control = this.control(id)) {
@@ -2354,6 +2444,12 @@ export class PairController extends EventEmitter {
         assert(repairReasons(report.checkpoint, t).length > 0, 'PAIR_NO_REPAIR: this report is not mechanically fixable, so it goes to Main');
       }
       const newSteps = input.action === 'revise' ? input.steps : undefined;
+      if (newSteps) {
+        assert(newSteps.length > t.stepIndex, 'The revised plan must still contain the current step position');
+        assert(t.steps.slice(0, t.stepIndex).every((step, index) => isDeepStrictEqual(step, newSteps[index])), 'Completed steps must be kept unchanged as the prefix of the revised plan');
+      }
+      // Validate the complete proposed continuation before mutating the live task or its work order.
+      const proposed = clone(t);
       if (input.action === 'revise') {
         // Configured maxRevisions is a floor: a longer plan may always be revised twice per step.
         assert(t.revisions < effectiveCaps(t).maxRevisions, 'Revision limit reached');
@@ -2363,15 +2459,12 @@ export class PairController extends EventEmitter {
           const replanned = replansCurrentStep(t, newSteps);
           const spent = t.stepReplans?.index === t.stepIndex ? t.stepReplans.count : 0;
           assert(replanned && spent < MAX_STEP_REPLANS, stepLimitMessage(t));
-          t.stepReplans = { index: t.stepIndex, count: spent + 1 };
+          proposed.stepReplans = { index: t.stepIndex, count: spent + 1 };
         }
-      }
-      if (newSteps) {
-        assert(newSteps.length > t.stepIndex, 'The revised plan must still contain the current step position');
-        assert(t.steps.slice(0, t.stepIndex).every((step, index) => isDeepStrictEqual(step, newSteps[index])), 'Completed steps must be kept unchanged as the prefix of the revised plan');
       }
       const finished = input.action === 'approve' && (report.payload.kind === 'final_review' || (report.payload.stepComplete !== false && t.stepIndex === t.steps.length - 1));
       if (!finished) await this.ensureRepoLock(r.repoRoot);
+      const fresh = !!r.freshSession;
       const launch = finished ? null : await this.reserveStart(r.id, true);
       if (launch) assert(this.launchCurrent(launch) && r.task === t && t.attemptId === reservation.attemptId && this.intent(r.id) === control.intent, 'Continuation was superseded');
       // 'fix' and 'fixed' never reach this transaction: 'fix' opens fix mode before it, 'fixed' finishes there.
@@ -2379,39 +2472,61 @@ export class PairController extends EventEmitter {
       /** @type {import('./contracts.js').ContinuationDecision} */
       const decision = { hash, feedback: input.feedback, ownerEpoch: this.state.ownerEpoch, workerGeneration: r.workerGeneration, attemptId: t.attemptId, deliveryOperationId: uid('decision-delivery'), at: Date.now(), reviewerModel: this.mainObservation?.model || null, delivery: 'pending',
         ...(action === 'approve' ? { action, checkpointHash: /** @type {string} */ (input.checkpointHash) } : { action, checkpointHash: input.checkpointHash || null }) };
-      t.decisions[input.reportId] = decision; t.lastDecision = { action, feedback: input.feedback, reportId: input.reportId };
-      t.timeline = normalizeTimeline([...(t.timeline ?? []), decisionEntry({ reportId: input.reportId, step: t.stepIndex + 1, action, at: decision.at, feedback: input.feedback })]);
-      if (this.state.notices[input.reportId]) this.state.notices[input.reportId].status = 'resolved';
-      if (this.state.mainPhase) this.setPhase('open');
+      proposed.decisions[input.reportId] = decision; proposed.lastDecision = { action, feedback: input.feedback, reportId: input.reportId };
+      proposed.timeline = normalizeTimeline([...(t.timeline ?? []), decisionEntry({ reportId: input.reportId, step: t.stepIndex + 1, action, at: decision.at, feedback: input.feedback })]);
       if (input.action === 'revise') {
-        t.revisions++;
+        proposed.revisions++;
         // A re-planned current step is a new step: its per-step revision count starts fresh.
-        t.stepRevisions = replansCurrentStep(t, newSteps) ? 0 : (t.stepRevisions ?? 0) + 1;
+        proposed.stepRevisions = replansCurrentStep(t, newSteps) ? 0 : (t.stepRevisions ?? 0) + 1;
       }
       if (newSteps) {
-        t.steps = clone(newSteps); t.planRevision = incrementCounter(t.planRevision, 'task.planRevision');
-        await atomicJSON(path.join(this.workerDir(r.id), 'work-order.json'),
-          { version: 1, taskId: t.id, planRevision: t.planRevision, objective: t.objective, context: bounded(t.context, 24000), constraints: t.constraints, writtenAt: Date.now() });
+        proposed.steps = clone(newSteps); proposed.planRevision = incrementCounter(t.planRevision, 'task.planRevision');
       }
       if (input.action === 'approve') {
-        t.baseSnapshotRef = report.snapshotRef;
+        proposed.baseSnapshotRef = report.snapshotRef;
         if (finished) {
-          this.revoke(r.id, 'Task completed'); t.status = 'completed'; t.completedAt = Date.now();
-          if (r.status !== 'stopped' && r.status !== 'error') r.status = 'ready';
-          decision.delivery = 'not_required'; await this.persist(); await this.writeAuthority(r.id, 'idle');
-          this.scheduleCollection();
-          return { completed: true };
-        }
-        if (report.payload.stepComplete !== false) {
-          t.stepIndex++; t.stepRevisions = 0;
+          proposed.status = 'completed'; proposed.completedAt = Date.now();
+          decision.delivery = 'not_required';
+        } else if (report.payload.stepComplete !== false) {
+          proposed.stepIndex++; proposed.stepRevisions = 0;
           // An approved step is progress: Main gets one recovery back (never below zero, never above the cap).
-          t.mainRecoveries = Math.max(0, (t.mainRecoveries ?? 0) - 1);
+          proposed.mainRecoveries = Math.max(0, (t.mainRecoveries ?? 0) - 1);
         }
       }
+      if (!finished) {
+        assert(launch, 'Missing continuation launch');
+        this.rotateAttempt(proposed); proposed.leaseId = uid('lease'); proposed.turns = 0; proposed.status = 'activating'; delete proposed.interruption;
+      }
+      const candidate = clone(this.state);
+      candidate.workers[r.id].task = proposed;
+      validateStoredState(candidate, { ownerSession: this.ownerSession, cwd: this.cwd });
+      if (newSteps) {
+        await atomicJSON(path.join(this.workerDir(r.id), 'work-order.json'),
+          { version: 1, taskId: proposed.id, planRevision: proposed.planRevision, objective: proposed.objective, context: bounded(proposed.context, 24000), constraints: proposed.constraints, writtenAt: Date.now() });
+        check();
+        assert(launch && this.launchCurrent(launch), 'Continuation was superseded');
+      }
+      Object.assign(t, proposed);
+      if (this.state.notices[input.reportId]) this.state.notices[input.reportId].status = 'resolved';
+      if (this.state.mainPhase) this.setPhase('open');
+      if (finished) {
+        this.revoke(r.id, 'Task completed');
+        if (r.status !== 'stopped' && r.status !== 'error') r.status = 'ready';
+        await this.persist(); await this.writeAuthority(r.id, 'idle');
+        this.scheduleCollection();
+        return { completed: true };
+      }
       assert(launch, 'Missing continuation launch');
-      this.rotateAttempt(t); t.leaseId = uid('lease'); t.turns = 0; t.status = 'activating'; delete t.interruption;
-      const work = this.reserveWork(launch, t); await this.persist();
-      return { work, decision };
+      delete t.interruption;
+      let work;
+      try { work = this.reserveWork(launch, t); }
+      catch (error) {
+        // A synchronous reservation failure must be recoverable too: no work prompt has been sent.
+        await this.interrupt(r.id, `Continuation reservation held (not retried): ${briefError(error)}`);
+        throw error;
+      }
+      await this.persist();
+      return { work, decision, fresh };
     });
     if (next.cancel) { await this.contain(next.cancel, input.feedback, false); await this.releaseRepoLocks(); }
     if (next.completed) await this.releaseRepoLocks();
@@ -2419,7 +2534,7 @@ export class PairController extends EventEmitter {
       const work = next.work, decision = next.decision;
       this.backgroundActivation(work, 'continuation', async () => {
         await this.fenced(work, this.startReserved(work));
-        const sent = await this.activate(work, this.decisionMessage(t, input, changedSince), {
+        const sent = await this.activate(work, this.decisionMessage(t, input, changedSince, next.fresh), {
           branch: reservation.branch,
           guard: async () => {
             const renewed = await this.evidence.capture(work.record.repoRoot);
@@ -2796,20 +2911,27 @@ export class PairController extends EventEmitter {
       if (t.limits.maxReportedCostUsd !== null) assert((t.usage?.reportedCost || 0) < t.limits.maxReportedCostUsd, 'Raise the reported cost budget before resuming');
       if (t.limits.maxOutputTokens !== null) assert((t.usage?.output || 0) < t.limits.maxOutputTokens, 'Raise the output-token budget before resuming');
       for (const notice of Object.values(this.state.notices)) if (notice.taskId === t.id && notice.status !== 'resolved') notice.status = 'superseded';
+      let pendingArchive = null;
       if (t.pendingReport) {
         const file = path.join(this.dir, 'tasks', t.id, `attempt-${t.attemptNumber}.json`);
-        await atomicJSON(file, t);
+        await mkdirPrivate(path.dirname(file));
+        try { await fs.writeFile(file, `${JSON.stringify(t, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 }); }
+        catch (error) {
+          if (!plain(error) || error.code !== 'EEXIST') throw error;
+          assert(isDeepStrictEqual(await readJSON(file), t), 'The pending-attempt archive already exists with different content; the task stays held.');
+        }
         assert(this.launchCurrent(launch) && r.task === t, 'Recovery was revoked while archiving the pending report');
-        r.history = [...r.history, { id: t.id, status: t.status, file }].slice(-40);
+        pendingArchive = { path: file, reportId: t.pendingReport.reportId, status: 'unfinished-unverified' };
+        t.pendingArchives = [...(t.pendingArchives || []), { reportId: t.pendingReport.reportId, attemptId: t.pendingReport.attemptId, path: file }].slice(-40);
         t.pendingReport = null;
       }
       this.rotateAttempt(t); t.leaseId = uid('lease'); t.turns = 0; t.startedAt = Date.now(); t.status = 'activating'; delete t.interruption; delete t.pausedBy; r.error = null;
       const work = this.reserveWork(launch, t);
-      await this.persist(); return { waitingRestored: null, work, fresh };
+      await this.persist(); return { waitingRestored: null, work, fresh, pendingArchive };
     });
     if (outcome.waitingRestored) return outcome.waitingRestored;
     const work = outcome.work;
-    try { await this.fenced(work, this.startReserved(work)); await this.fenced(work, this.prepareBase(work)); await this.activate(work, `${this.workMessage(work.task, outcome.fresh)}\nRECOVERY\n${JSON.stringify({ resumedBy: recovery.by, ...(recovery.instruction ? { supervisorNote: recovery.instruction } : {}), instruction: 'Inspect existing changes and tool outcomes BEFORE doing more work. Do not replay previous mutations blindly. Resume the authorized step and finish it with pair_report, or ask a question.' })}`); }
+    try { await this.fenced(work, this.startReserved(work)); await this.fenced(work, this.prepareBase(work)); await this.activate(work, `${this.workMessage(work.task, outcome.fresh)}\nRECOVERY\n${JSON.stringify({ resumedBy: recovery.by, ...(recovery.instruction ? { supervisorNote: recovery.instruction } : {}), ...(outcome.pendingArchive ? { unfinishedReport: outcome.pendingArchive } : {}), instruction: 'Inspect existing changes and tool outcomes BEFORE doing more work. Do not replay previous mutations blindly. Resume the authorized step and finish it with pair_report, or ask a question.' })}`); }
     catch (error) { await this.activationFailed(work, error); throw error; }
     return { taskId: work.task.id, status: work.task.status };
   }
@@ -2886,12 +3008,13 @@ export class PairController extends EventEmitter {
    * a spent cost/token budget or an unconfirmed exit, and never runs inside a transaction (the caller runs it
    * as a scan job). When its budget is spent it escalates to Main instead of acting again.
    * @param {string} id @param {string} taskId
-   * @param {'no-report' | 'crash' | 'tool' | 'frozen' | 'stalled' | 'provider'} kind
+   * @param {'no-report' | 'crash' | 'tool' | 'frozen' | 'stalled' | 'provider' | 'context'} kind
    * @param {string} instruction
    * @returns {Promise<{recovered: boolean, reason?: string, recoveriesUsed?: number}>}
    */
   async autoRecover(id, taskId, kind, instruction) {
-    if (!this.watchdogEnabled() || this.closing) return { recovered: false, reason: 'the watchdog is off' };
+    // A proven context overflow requires a new thread, not watchdog nudges or a retry on the full context.
+    if ((!this.watchdogEnabled() && kind !== 'context') || this.closing) return { recovered: false, reason: 'the watchdog is off or Pair is closing' };
     const guard = await this.transaction(() => {
       const r = this.record(id), t = r.task;
       if (!t || t.id !== taskId) return { refuse: 'task changed' };
@@ -3056,6 +3179,111 @@ export class PairController extends EventEmitter {
     });
     return true;
   }
+  /** Explicitly link a task to an existing LoomKit change without changing the checklist.
+   * @param {string} workerId @param {string} taskId @param {string} workspace @param {string} change
+   */
+  async linkLoomkit(workerId, taskId, workspace, change) {
+    safeId(change, 'LoomKit change');
+    return this.transaction(async () => {
+      const record = this.record(workerId), task = record.task;
+      assert(task?.id === taskId && !TERMINAL.has(task.status), 'No matching active task for this worker.');
+      const root = await repositoryRoot(workspace);
+      assert(root === record.repoRoot, 'LoomKit workspace must be the worker repository.');
+      const layout = await loomkitLayout(root);
+      if (task.loomkit) assert(task.loomkit.workspace === root && task.loomkit.change === change && (task.loomkit.layout || 'openspec') === layout, 'Task already has a different LoomKit association.');
+      task.loomkit = { workspace: root, change, layout };
+      await this.persist();
+      const error = this.loomkitErrors.get(taskId);
+      assert(!error, `LoomKit association is held: ${error}. The task and evidence were preserved; retry after fixing metadata access.`);
+      return { workerId, taskId, workspace: root, change, path: loomkitLinkPath(task.loomkit, taskId), taskStatus: task.status,
+        message: 'Pair metadata only. LoomKit checklist and gates were not changed.' };
+    });
+  }
+
+  /**
+   * Preserve a context-recovery handoff outside the workspace, then start a new worker only after
+   * confirming the old process and checkpoint. A single immutable file per task step bounds replacement.
+   * @param {string} id
+   * @param {{cause: 'overflow' | 'compaction-retries-exhausted', taskId: string, attemptId: string, leaseId: string, message: string}} overflow
+   */
+  async recoverContextFailure(id, overflow) {
+    const r = this.record(id), t = r.task;
+    assert(t && t.id === overflow.taskId && t.attemptId === overflow.attemptId && t.leaseId === overflow.leaseId && t.status === 'interrupted', 'Overflow task or lease changed; the handoff stays held');
+    const generation = r.workerGeneration, oldSession = r.sessionFile;
+    const current = () => this.state.workers[id] === r && r.task === t && t.status === 'interrupted' && t.attemptId === overflow.attemptId && t.leaseId === overflow.leaseId && r.workerGeneration === generation;
+    const proof = await this.exitProof(r).catch(error => ({ exited: false, pid: null, reason: briefError(error) }));
+    assert(current(), 'Overflow handoff was superseded while proving exit');
+    /** @type {string[]} */ const issues = [];
+    /** @type {{reportId: string, checkpointHash: string, path: string, snapshotRef: string} | null} */ let checkpoint = null;
+    /** @type {string[] | null} */ let uncheckpointed = null;
+    /** @type {string | null} */ let workspaceHash = null;
+    if (!proof.exited) issues.push(`Old worker exit is unconfirmed: ${proof.reason}`);
+    const report = t.report, decision = report && t.decisions[report.reportId];
+    // A process may fail before the regular scan ingests its latch/inbox. Never skip an
+    // unreviewed report merely because the same attempt also overflowed.
+    try {
+      const dir = this.workerDir(id), inbox = path.join(dir, 'inbox');
+      const names = await fs.readdir(inbox).catch(error => { if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return []; throw error; });
+      /** @type {unknown[]} */ const pending = [];
+      for (const name of names.filter(n => /^report-[a-z0-9-]+\.json$/i.test(n))) pending.push(await readJSON(path.join(inbox, name)));
+      const rawLatch = await readJSON(path.join(dir, 'latch.json'), undefined, 16 * 1024 * 1024);
+      if (rawLatch !== undefined) pending.push(validateLatch(rawLatch).report);
+      for (const value of pending) {
+        const incoming = validateReportEnvelope(value);
+        if (!report || !decision || decision.action !== 'approve' || incoming.reportId !== report.reportId || incoming.attemptId === t.attemptId) {
+          issues.push(`Retained report ${incoming.reportId} requires reconciliation before a fresh worker.`); continue;
+        }
+        const { checkpoint: _checkpoint, snapshotRef: _snapshotRef, inspectedAt: _inspectedAt, ...original } = report;
+        this.assertSameReport(incoming, original);
+      }
+    } catch (error) { issues.push(`Retained reports could not be verified: ${briefError(error)}`); }
+    if (!report || !decision || decision.action !== 'approve' || decision.checkpointHash !== report.checkpoint.checkpointHash) {
+      issues.push('No verified, approved checkpoint is available for this task.');
+    } else if (proof.exited) {
+      try {
+        const expected = path.join(this.dir, 'evidence', 'reports', t.id, report.reportId);
+        assert(path.resolve(report.checkpoint.path) === path.resolve(expected), 'Checkpoint path does not match task and report');
+        const manifest = await readJSON(path.join(expected, 'manifest.json'));
+        assert(plain(manifest) && manifest.taskId === t.id && manifest.reportId === report.reportId && manifest.checkpointHash === report.checkpoint.checkpointHash, 'Checkpoint manifest identity mismatch');
+        assert(JSON.stringify(manifest.changed) === JSON.stringify(report.checkpoint.changed) && JSON.stringify(manifest.verification) === JSON.stringify(report.checkpoint.verification) && manifest.patchTruncated === report.checkpoint.patchTruncated, 'Checkpoint manifest does not match the approved report');
+        assert(Array.isArray(manifest.files) && JSON.stringify(manifest.files.map(entry => { assert(plain(entry) && typeof entry.path === 'string', 'Invalid checkpoint file entry'); return entry.path; })) === JSON.stringify(report.checkpoint.changed), 'Checkpoint file list does not match the approved report');
+        const inspected = await this.evidence.inspect(expected);
+        assert(inspected.checkpointHash === report.checkpoint.checkpointHash, 'Checkpoint hash mismatch');
+        for (const name of report.checkpoint.changed) await this.evidence.inspect(expected, name);
+        assert(JSON.stringify(await readJSON(path.join(expected, 'manifest.json'))) === JSON.stringify(manifest), 'Checkpoint manifest changed during verification');
+        const baseline = await this.evidence.readSnapshot(report.snapshotRef, r.repoRoot);
+        assert(baseline.hash === report.checkpoint.checkpointHash, 'Checkpoint snapshot mismatch');
+        const live = await this.evidence.capture(r.repoRoot);
+        assert(current(), 'Overflow handoff was superseded while capturing workspace');
+        checkpoint = { reportId: report.reportId, checkpointHash: report.checkpoint.checkpointHash, path: expected, snapshotRef: report.snapshotRef };
+        workspaceHash = live.hash; uncheckpointed = snapshotDelta(baseline, live);
+      } catch (error) { issues.push(`Checkpoint or workspace could not be verified: ${briefError(error)}`); }
+    }
+    assert(current(), 'Overflow handoff was superseded before write');
+    const directory = path.join(this.dir, 'tasks', t.id), file = path.join(directory, `context-recovery-step-${t.stepIndex}.json`);
+    await mkdirPrivate(directory);
+    const handoff = { version: 1, kind: 'context-recovery', cause: overflow.cause, taskId: t.id, workerId: id, stepIndex: t.stepIndex, attemptId: t.attemptId,
+      leaseId: t.leaseId, workerGeneration: generation, oldSession, failure: bounded(overflow.message, 500), exit: proof,
+      objective: t.objective, loomkit: t.loomkit || null, checkpoint, workspaceHash, uncheckpointed, issues, createdAt: Date.now() };
+    const bytes = `${JSON.stringify(handoff, null, 2)}\n`;
+    const handle = await fs.open(file, 'wx', 0o600);
+    try { await handle.writeFile(bytes, 'utf8'); await handle.sync(); } finally { await handle.close(); }
+    assert(current(), 'Overflow handoff was superseded after write');
+    if (issues.length) {
+      const why = `Context recovery handoff saved at ${file}; ${issues.join(' ')}`;
+      this.notifyUser(`[${id}] ${why}`, 'warning'); this.superviseMain('stuck', id, t, why); return { recovered: false, file, issues };
+    }
+    await this.stop(id);
+    await this.transaction(async () => {
+      assert(current() && r.status === 'stopped' && !this.handles.has(id), 'Old worker exit or task changed before fresh session');
+      r.freshSession = true; await this.persist();
+    });
+    const instruction = `Context recovery: the old worker is stopped and its transcript is retained. Read the LoomKit plan and this durable handoff before continuing: ${file}. Handoff SHA-256: ${digest(bytes)}. Verified checkpoint: ${checkpoint?.checkpointHash}. Uncheckpointed paths: ${JSON.stringify(uncheckpointed)}. Inspect existing changes; never replay uncertain side effects blindly.`;
+    const result = await this.autoRecover(id, t.id, 'context', instruction);
+    if (!result.recovered) this.superviseMain('stuck', id, t, `Context recovery handoff saved at ${file}; fresh recovery held: ${result.reason || 'unknown'}`);
+    return { ...result, file, issues };
+  }
+
   /**
    * Main-initiated recovery of a paused or interrupted task. Never bypasses an unconfirmed exit,
    * a human pause or a spent budget; those stay with the human.

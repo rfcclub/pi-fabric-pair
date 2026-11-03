@@ -1,6 +1,6 @@
 ---
 name: fabric-pair
-description: Delegate bounded implementation to retained Pi workers, handle worker questions, and review immutable checkpoints without switching Main or recreating conversations.
+description: Delegate bounded implementation to retained Pi workers, review immutable checkpoints, and safely continue work after an abrupt Main session loss.
 ---
 
 # Fabric Pair workflow
@@ -15,7 +15,9 @@ Do not arm native Prewalk for a Pair assignment.
 With Fabric active, Pair's tools are captured extension tools with the refs
 `extensions.pair_status`, `extensions.pair_dispatch`, `extensions.pair_inspect`,
 `extensions.pair_decide`, `extensions.pair_peek`, `extensions.pair_steer`,
-`extensions.pair_cancel`, `extensions.pair_recover` and `extensions.pair_yield`.
+`extensions.pair_cancel`, `extensions.pair_recover`, `extensions.pair_yield`,
+`extensions.pair_discover`, `extensions.pair_inspect_workspace`, `extensions.pair_adopt`,
+`extensions.pair_link_loomkit` and `extensions.pair_continue`.
 The worker role exposes `extensions.pair_report`. Call them directly inside
 `fabric_exec`; do not search the catalog first:
 
@@ -28,6 +30,17 @@ The same direct form works in the Python kernel
 error, read the schema once with `tools.describe({ ref: "extensions.pair_dispatch" })`
 (or the tool you called). When Fabric is not capturing tools, ordinary Pi tool
 names are `pair_status`, etc.
+
+### Continue after an abrupt Main session loss
+
+1. Call `pair_discover({})` for configured Git workspaces. Its checkpoint hashes are references, not proof. If a report is listed, call `pair_inspect_workspace({workspace, ownerSession, workerId, taskId, reportId})` to verify and inspect it; file-specific reads are hash checked. The summary patch itself is not authenticated.
+2. Review the actual LoomKit change and its checklist with `loomkit_plan` when applicable. Never infer a task completion or gate PASS from a checkpoint. If the task has not been explicitly associated, use `pair_link_loomkit({workerId, taskId, workspace, change})` after adoption. Link errors are visible in `pair_status` and do not delete the task or report.
+3. Call `pair_adopt({workspace, ownerSession, workerId, taskId})` using the exact discovered assignment. Pair proves the previous owner/worker exited, retains the original report identity, keeps a SHA-bound preimage, and holds uncertain or conflicting ownership. If the old session has multiple unfinished tasks, Pair holds them rather than silently transferring unrelated assignments. Adoption never starts work or approves a report.
+4. A pending review remains in review: call `pair_inspect` and decide against its exact hash. For an interrupted adopted task, use `pair_continue({workerId, taskId, instruction})`; it creates a **fresh worker conversation**, supplies the retained plan, LoomKit association and last checkpoint, and follows normal exit, human-pause and budget guards. An unfinished, unverified report is preserved separately and must not be treated as a checkpoint.
+
+Do not stop another live writer, delete locks, change request IDs or blindly replay mutations to force continuation. Pair without LoomKit remains supported.
+
+During a task, confirmed context overflow goes straight to a durable handoff and a fresh worker; native compaction that exhausts its configured retries uses the same guarded route. Pair verifies old-process exit, an approved checkpoint and retained reports first, preserves the old transcript and uncheckpointed changes, and bounds replacement per step. If those proofs are missing or conflicting, the task stays held for Main; do not force a restart or replay.
 
 ### Looking at and steering a running worker
 

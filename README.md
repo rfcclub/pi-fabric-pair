@@ -80,9 +80,9 @@ policy asks for or denies some risk classes, classify Pair's tools in the same
 {
   "capture": {
     "risks": {
-      "pair_status": "read", "pair_inspect": "read",
-      "pair_yield": "write", "pair_cancel": "write", "pair_report": "write",
-      "pair_dispatch": "agent", "pair_decide": "agent", "pair_recover": "agent"
+      "pair_status": "read", "pair_inspect": "read", "pair_discover": "read", "pair_inspect_workspace": "read",
+      "pair_yield": "write", "pair_cancel": "write", "pair_report": "write", "pair_adopt": "write", "pair_link_loomkit": "write",
+      "pair_dispatch": "agent", "pair_decide": "agent", "pair_recover": "agent", "pair_continue": "agent"
     }
   }
 }
@@ -178,6 +178,15 @@ By default (`autoDeliverReports: true`) a finished report is delivered to Main
 automatically once Main's current work is done, and never interrupts it. Review gates govern
 Main's decisions; asking the human before each approval requires that explicit
 instruction.
+
+## Continuing after an abrupt Main exit
+
+A new Main can recover a retained workspace assignment without resuming the old Pi conversation:
+
+1. Use `pair_discover({})`, then `pair_inspect_workspace({workspace, ownerSession, workerId, taskId, reportId})` for the exact retained report. Its checkpoint and file snapshots are hash checked; the summary patch itself is not authenticated.
+2. Review the actual LoomKit plan and checklist if one applies. `pair_adopt({workspace, ownerSession, workerId, taskId})` transfers authority only after proving the previous owner and worker exited. It preserves producer identity and SHA-backed state preimages; uncertain exit, conflicting writers or damaged evidence remain held. A session containing multiple unfinished tasks is also held rather than silently transferring other assignments. Adoption never starts work or approves a report.
+3. Associate an approved change explicitly with `pair_link_loomkit({workerId, taskId, workspace, change})`. Pair writes `.pair-checkpoint-<taskId>.json` beside `tasks.md` in `openspec/changes` or `loomkit/changes` (preferring `openspec/` as the CLI does); it is Pair-owned metadata, not worker evidence. It records the exact report/hash and Pair decision, **not** a LoomKit checklist update or gate verdict. A write error appears in `pair_status`; retry after fixing the cause. Pair works without LoomKit.
+4. Review a pending report with the usual `pair_inspect` / `pair_decide`. For an interrupted adopted task, `pair_continue({workerId, taskId, instruction})` starts a new worker conversation with the retained plan, last verified checkpoint and optional LoomKit link. Unfinished reports are preserved separately as unverified; work is never silently replayed. Normal human-pause, exit and budget guards still apply.
 
 ## Worker backends
 
@@ -720,6 +729,18 @@ settles. Pair treats that compaction as maintenance, not stray work: it lets it 
 (`control.compactionMaxMs`, 10 min by default; `0` refuses it) and the report settle
 clocks, checkpoint freezing and the next prompt all wait for it. Stopping it would mean
 a 1M-token worker never compacts and every request stays slow.
+
+**Context exhaustion during a task.** On a confirmed context overflow, a Pi worker's
+exhausted conversation is not retried. If native compaction exhausts its configured
+transient retries, Pair follows the same recovery path without adding another retry
+loop. Pair stops the old process, writes a durable handoff with the linked LoomKit
+change, approved checkpoint and uncheckpointed paths, verifies checkpoint contents,
+then starts a fresh worker session for the same authorized step. The old transcript and
+worktree remain untouched. A missing or corrupt approved checkpoint, unreviewed report,
+unconfirmed old-process exit, human pause or other safety/budget refusal holds recovery
+for Main instead; at most one automatic context handoff is attempted per task step.
+Pair does not change Pi's global reserve or retry settings itself; project/model
+settings and Pi's retry policy still apply.
 
 **Context hygiene between tasks.** A task never starts in a context that is
 already too large. Before a dispatch sends the work prompt, Pair reads the worker's own

@@ -152,6 +152,56 @@ test('control.compactionMaxMs is configurable, bounded, and stays out of configH
   assert.throws(() => validateConfig({ version: 2, control: { compactionMaxMs: 1.5 } }), /control.compactionMaxMs/);
 });
 
+test('exhausted native compaction retries are bound to the active attempt', async () => {
+  const f = await runtimeFixture();
+  try {
+    const token = f.runtime.reserveActivation({ taskId: 't-compact', attemptId: 'a-compact', leaseId: 'l-compact', workerGeneration: 1 });
+    await f.runtime.prepareActivation(token); await f.runtime.activate(token, 'work');
+    f.rpc.emit('event', { type: 'compaction_start', reason: 'threshold' });
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      f.rpc.emit('event', { type: 'summarization_retry_scheduled', attempt, maxAttempts: 3, delayMs: 0, errorMessage: '503 temporary failure' });
+      f.rpc.emit('event', { type: 'summarization_retry_attempt_start', source: 'compaction', reason: 'threshold' });
+    }
+    f.rpc.emit('event', { type: 'summarization_retry_finished' });
+    f.rpc.emit('event', { type: 'compaction_end', reason: 'threshold', aborted: false, willRetry: false, errorMessage: 'Auto-compaction failed: 503 temporary failure' });
+    assert.equal(f.runtime.contextFailure?.cause, 'compaction-retries-exhausted');
+    assert.equal(f.runtime.contextFailure?.attemptId, 'a-compact');
+  } finally { await cleanup(f); }
+});
+
+test('partial retry, cancellation and successful compaction never trigger context recovery', async () => {
+  for (const scenario of ['partial', 'cancelled', 'success']) {
+    const f = await runtimeFixture();
+    try {
+      const token = f.runtime.reserveActivation({ taskId: 't-negative', attemptId: 'a-negative', leaseId: 'l-negative', workerGeneration: 1 });
+      await f.runtime.prepareActivation(token); await f.runtime.activate(token, 'work');
+      f.rpc.emit('event', { type: 'compaction_start', reason: 'threshold' });
+      const count = scenario === 'partial' ? 2 : 3;
+      for (let attempt = 1; attempt <= count; attempt++) {
+        f.rpc.emit('event', { type: 'summarization_retry_scheduled', attempt, maxAttempts: 3, delayMs: 0, errorMessage: '503 temporary failure' });
+        f.rpc.emit('event', { type: 'summarization_retry_attempt_start', source: 'compaction', reason: 'threshold' });
+      }
+      f.rpc.emit('event', { type: 'summarization_retry_finished' });
+      f.rpc.emit('event', { type: 'compaction_end', reason: 'threshold', aborted: scenario === 'cancelled', willRetry: false, ...(scenario === 'success' ? { result: {} } : scenario === 'partial' ? { errorMessage: 'Auto-compaction failed: 400' } : {}) });
+      assert.equal(f.runtime.contextFailure, null, scenario);
+    } finally { await cleanup(f); }
+  }
+});
+
+test('runtime records actual overflow against the current activation only', async () => {
+  const f = await runtimeFixture();
+  try {
+    const token = f.runtime.reserveActivation({ taskId: 't-overflow', attemptId: 'a-overflow', leaseId: 'l-overflow', workerGeneration: 1 });
+    await f.runtime.prepareActivation(token);
+    await f.runtime.activate(token, 'work');
+    f.rpc.emit('event', { type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'maximum context length exceeded', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } });
+    assert.equal(f.runtime.contextOverflow?.attemptId, 'a-overflow');
+    assert.equal(f.runtime.contextOverflow?.taskId, 't-overflow');
+    f.rpc.emit('event', { type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: '503 service unavailable', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } });
+    assert.equal(f.runtime.contextOverflow, null, 'an unrelated later response must not inherit an old overflow');
+  } finally { await cleanup(f); }
+});
+
 test('a compaction after the run settles finishes instead of being aborted', async () => {
   const f = await runtimeFixture();
   try {

@@ -64,6 +64,9 @@ export const decisionSchema = object({
   steps: { ...array(stepSchema, 32), minItems: 1, description: 'revise only: the complete replacement plan. Completed steps must be kept unchanged as its prefix; this starts a new plan revision.' }
 }, ['workerId', 'taskId', 'reportId', 'action', 'feedback']);
 export const inspectSchema = object({ workerId: string('Worker ID', 80), taskId: string('Optional; must be the current task ID', 80), reportId: string('Report ID; omit for latest', 80), file: string('Optional changed path to read from immutable evidence', 1024) }, ['workerId']);
+export const loomkitLinkSchema = object({ workerId: string('Worker ID', 80), taskId: string('Task ID', 80), workspace: string('LoomKit Git workspace', 10000), change: string('Existing LoomKit change name', 80) }, ['workerId', 'taskId', 'workspace', 'change']);
+export const workspaceAdoptSchema = object({ workspace: string('Configured Git workspace', 10000), ownerSession: string('Main session currently recorded on the retained assignment', 10000), workerId: string('Worker ID', 80), taskId: string('Exact retained task ID', 80) }, ['workspace', 'ownerSession', 'workerId', 'taskId']);
+export const workspaceInspectSchema = object({ workspace: string('Configured Git workspace', 10000), ownerSession: string('Original Main session identity', 10000), workerId: string('Worker ID', 80), taskId: string('Exact task ID', 80), reportId: string('Exact report ID', 80), file: string('Optional changed file', 1024) }, ['workspace', 'ownerSession', 'workerId', 'taskId', 'reportId']);
 export const peekSchema = object({ workerId: string('Worker ID', 80) }, ['workerId']);
 export const steerSchema = object({ workerId: string('Worker ID', 80), taskId: string('Task ID', 80), message: string('Instruction for the running step (at most 4000 characters)', 4000) }, ['workerId', 'taskId', 'message']);
 export const statusSchema = object({}, []);

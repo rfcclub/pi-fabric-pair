@@ -137,6 +137,7 @@ async function workerFixture(shellGuard, run) {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'pair-shell-guard-')));
   const dir = path.join(base, 'worker'), cwd = path.join(base, 'repo'), home = path.join(base, 'agent');
   await Promise.all([dir, cwd, home].map(p => fs.mkdir(p)));
+  await fs.writeFile(path.join(home, 'fabric.json'), JSON.stringify({ executor: { shellHangMs: 0 } }));
   const previous = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = home;
   const authority = { version: 1, ownerSession: 'guard-owner', ownerEpoch: 1, workerId: 'worker', workerGeneration: 1,
     phase: 'running', leaseId: 'guard-lease-1', attemptId: 'guard-attempt-1', readOnly: false, model: { provider: 'fake', id: 'model' }, repoRoot: cwd,
@@ -153,7 +154,7 @@ async function workerFixture(shellGuard, run) {
     sessionManager: { getSessionId: () => 'guard-session', getSessionFile: () => path.join(base, 'guard-session.jsonl') },
     getContextUsage: () => undefined, isProjectTrusted: () => false,
     abort: () => {}, shutdown: () => {}, ui: { setStatus: () => {}, setWidget: () => {}, notify: () => {} } };
-  const env = { PI_FABRIC_PAIR_WORKER_ID: 'worker', PI_FABRIC_PAIR_OWNER: 'guard-owner', PI_FABRIC_PAIR_OWNER_EPOCH: '1',
+  const env = { PI_CODING_AGENT_DIR: home, PI_FABRIC_PAIR_WORKER_ID: 'worker', PI_FABRIC_PAIR_OWNER: 'guard-owner', PI_FABRIC_PAIR_OWNER_EPOCH: '1',
     PI_FABRIC_PAIR_WORKER_GENERATION: '1', PI_FABRIC_PAIR_NONCE: 'guard-nonce', PI_FABRIC_PAIR_WORKER_DIR: dir };
   registerWorker(pi, env);
   const call = input => events.get('tool_call')({ toolName: 'bash', input, toolCallId: 'call-1' }, ctx);
